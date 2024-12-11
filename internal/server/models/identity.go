@@ -3,8 +3,6 @@ package models
 import (
 	"time"
 
-	"github.com/ssoroka/slice"
-
 	"github.com/infrahq/infra/api"
 	"github.com/infrahq/infra/uid"
 )
@@ -36,26 +34,24 @@ type Identity struct {
 }
 
 func (i *Identity) ToAPI() *api.User {
+	providerNames := []string{}
+	for _, p := range i.Providers {
+		providerNames = append(providerNames, p.Name)
+	}
+
 	u := &api.User{
-		ID:           i.ID,
-		Created:      api.Time(i.CreatedAt),
-		Updated:      api.Time(i.UpdatedAt),
-		LastSeenAt:   api.Time(i.LastSeenAt),
-		Name:         i.Name,
-		SSHLoginName: i.SSHLoginName,
-		ProviderNames: slice.Map[Provider, string](i.Providers, func(p Provider) string {
-			return p.Name
-		}),
+		ID:            i.ID,
+		Created:       api.Time(i.CreatedAt),
+		Updated:       api.Time(i.UpdatedAt),
+		LastSeenAt:    api.Time(i.LastSeenAt),
+		Name:          i.Name,
+		SSHLoginName:  i.SSHLoginName,
+		ProviderNames: providerNames,
 	}
 	for _, k := range i.PublicKeys {
 		u.PublicKeys = append(u.PublicKeys, k.ToAPI())
 	}
 	return u
-}
-
-// PolyID is a polymorphic name that points to both a model type and an ID
-func (i *Identity) PolyID() uid.PolymorphicID {
-	return uid.NewIdentityPolymorphicID(i.ID)
 }
 
 type UserPublicKey struct {
@@ -77,5 +73,6 @@ func (u UserPublicKey) ToAPI() api.UserPublicKey {
 		PublicKey:   u.PublicKey,
 		KeyType:     u.KeyType,
 		Fingerprint: u.Fingerprint,
+		Expires:     api.Time(u.ExpiresAt),
 	}
 }

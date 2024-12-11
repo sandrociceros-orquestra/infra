@@ -3,18 +3,22 @@ package server
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"path"
 	"reflect"
 	"strings"
 
-	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/Masterminds/semver/v3"
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 
+	"github.com/infrahq/infra/api"
 	"github.com/infrahq/infra/internal"
 	"github.com/infrahq/infra/internal/access"
 	"github.com/infrahq/infra/internal/logging"
+	"github.com/infrahq/infra/internal/openapi3"
 	"github.com/infrahq/infra/internal/validate"
 	"github.com/infrahq/infra/metrics"
 )
@@ -22,7 +26,8 @@ import (
 // Routes is the return value of GenerateRoutes.
 type Routes struct {
 	http.Handler
-	OpenAPIDocument openapi3.T
+	OpenAPIDocument openapi3.Doc
+	api             *API
 }
 
 // GenerateRoutes constructs a http.Handler for the primary http and https servers.
@@ -35,14 +40,10 @@ type Routes struct {
 // with all the middleware that will apply to the route when the
 // Router.{GET,POST,etc} method is called.
 func (s *Server) GenerateRoutes() Routes {
-	a := &API{t: s.tel, server: s}
-	a.addRewrites()
-	a.addRedirects()
+	a := &API{t: s.tel, server: s, openAPIDoc: newOpenAPIDoc(productVersion())}
 
 	router := gin.New()
 	router.NoRoute(a.notFoundHandler)
-
-	router.Use(gin.Recovery())
 	router.GET("/healthz", healthHandler)
 
 	// This group of middleware will apply to everything, including the UI
@@ -56,7 +57,7 @@ func (s *Server) GenerateRoutes() Routes {
 
 	get(a, authn, "/api/users", a.ListUsers)
 	post(a, authn, "/api/users", a.CreateUser)
-	get(a, authn, "/api/users/:id", a.GetUser)
+	add(a, authn, http.MethodGet, "/api/users/:id", getUserRoute)
 	put(a, authn, "/api/users/:id", a.UpdateUser)
 	del(a, authn, "/api/users/:id", a.DeleteUser)
 	put(a, authn, "/api/users/public-key", AddUserPublicKey)
@@ -76,6 +77,7 @@ func (s *Server) GenerateRoutes() Routes {
 	post(a, authn, "/api/organizations", a.CreateOrganization)
 	get(a, authn, "/api/organizations/:id", a.GetOrganization)
 	del(a, authn, "/api/organizations/:id", a.DeleteOrganization)
+	put(a, authn, "/api/organizations/:id", a.UpdateOrganization)
 
 	get(a, authn, "/api/grants", a.ListGrants)
 	get(a, authn, "/api/grants/:id", a.GetGrant)
@@ -94,7 +96,7 @@ func (s *Server) GenerateRoutes() Routes {
 	put(a, authn, "/api/destinations/:id", a.UpdateDestination)
 	del(a, authn, "/api/destinations/:id", a.DeleteDestination)
 
-	post(a, authn, "/api/tokens", a.CreateToken)
+	add(a, authn, http.MethodPost, "/api/tokens", createTokenRoute)
 	post(a, authn, "/api/logout", a.Logout)
 
 	// SCIM inbound provisioning
@@ -105,19 +107,17 @@ func (s *Server) GenerateRoutes() Routes {
 	add(a, authn, http.MethodPatch, "/api/scim/v2/Users/:id", patchProviderUserRoute)
 	add(a, authn, http.MethodDelete, "/api/scim/v2/Users/:id", deleteProviderUserRoute)
 
-	put(a, authn, "/api/settings", a.UpdateSettings)
-
 	add(a, authn, http.MethodGet, "/api/debug/pprof/*profile", pprofRoute)
 
 	// no auth required, org not required
-	noAuthnNoOrg := &routeGroup{RouterGroup: apiGroup.Group("/"), noAuthentication: true, noOrgRequired: true}
+	noAuthnNoOrg := &routeGroup{RouterGroup: apiGroup.Group("/"), authenticationOptional: true, organizationOptional: true}
 	add(a, noAuthnNoOrg, http.MethodPost, "/api/signup", a.SignupRoute())
 	get(a, noAuthnNoOrg, "/api/version", a.Version)
 	get(a, noAuthnNoOrg, "/api/server-configuration", a.GetServerConfiguration)
 	post(a, noAuthnNoOrg, "/api/forgot-domain-request", a.RequestForgotDomains)
 
 	// no auth required, org required
-	noAuthnWithOrg := &routeGroup{RouterGroup: apiGroup.Group("/"), noAuthentication: true}
+	noAuthnWithOrg := &routeGroup{RouterGroup: apiGroup.Group("/"), authenticationOptional: true}
 
 	post(a, noAuthnWithOrg, "/api/login", a.Login)
 	post(a, noAuthnWithOrg, "/api/password-reset-request", a.RequestPasswordReset)
@@ -125,7 +125,6 @@ func (s *Server) GenerateRoutes() Routes {
 
 	get(a, noAuthnWithOrg, "/api/providers/:id", a.GetProvider)
 	get(a, noAuthnWithOrg, "/api/providers", a.ListProviders)
-	get(a, noAuthnWithOrg, "/api/settings", a.GetSettings)
 	add(a, noAuthnWithOrg, http.MethodGet, "/link", verifyAndRedirectRoute)
 
 	add(a, noAuthnWithOrg, http.MethodGet, "/.well-known/jwks.json", wellKnownJWKsRoute)
@@ -136,6 +135,9 @@ func (s *Server) GenerateRoutes() Routes {
 	post(a, authn, "/api/device/approve", a.ApproveDeviceFlow)
 
 	a.deprecatedRoutes(noAuthnNoOrg)
+	a.addPreviousVersionHandlersAccessKey()
+	a.addPreviousVersionHandlersSignup()
+	a.addPreviousVersionHandlersGrants()
 
 	// registerUIRoutes must happen last because it uses catch-all middleware
 	// with no handlers. Any route added after the UI will end up using the
@@ -143,10 +145,10 @@ func (s *Server) GenerateRoutes() Routes {
 	// This is a limitation because we serve the UI from / instead of a specific
 	// path prefix.
 	registerUIRoutes(router, s.options.UI)
-	return Routes{Handler: router, OpenAPIDocument: a.openAPIDoc}
+	return Routes{Handler: router, OpenAPIDocument: a.openAPIDoc, api: a}
 }
 
-type HandlerFunc[Req, Res any] func(c *gin.Context, req *Req) (Res, error)
+type HandlerFunc[Req, Res any] func(rCtx access.RequestContext, req *Req) (Res, error)
 
 type route[Req, Res any] struct {
 	routeSettings
@@ -159,6 +161,7 @@ type routeSettings struct {
 	infraVersionHeaderOptional bool
 	authenticationOptional     bool
 	organizationOptional       bool
+	idpSync                    bool // when true the user session will be syncronized with the identity provider on a timed interval
 	txnOptions                 *sql.TxOptions
 }
 
@@ -171,8 +174,8 @@ type routeIdentifier struct {
 // constructed from the get, post, put, del helper functions.
 type routeGroup struct {
 	*gin.RouterGroup
-	noAuthentication bool
-	noOrgRequired    bool
+	authenticationOptional bool
+	organizationOptional   bool
 }
 
 func add[Req, Res any](a *API, group *routeGroup, method, urlPath string, route route[Req, Res]) {
@@ -181,19 +184,32 @@ func add[Req, Res any](a *API, group *routeGroup, method, urlPath string, route 
 		path:   path.Join(group.BasePath(), urlPath),
 	}
 
-	route.authenticationOptional = group.noAuthentication
-	route.organizationOptional = group.noOrgRequired
+	route.authenticationOptional = group.authenticationOptional
+	route.organizationOptional = group.organizationOptional
 
 	if !route.omitFromDocs {
 		a.register(openAPIRouteDefinition(routeID, route))
 	}
 
 	handler := func(c *gin.Context) {
+		reqVer, err := requestVersion(c.Request)
+		if err != nil && !route.infraVersionHeaderOptional {
+			sendAPIError(c.Writer, c.Request, err)
+			return
+		}
+
+		versions := a.versions[routeID]
+		if versionedHandler := handlerForVersion(versions, reqVer); versionedHandler != nil {
+			versionedHandler(c)
+			return
+		}
+
 		if err := wrapRoute(a, routeID, route)(c); err != nil {
-			sendAPIError(c, err)
+			sendAPIError(c.Writer, c.Request, err)
+			return
 		}
 	}
-	bindRoute(a, group.RouterGroup, routeID, handler)
+	group.RouterGroup.Handle(routeID.method, routeID.path, handler)
 }
 
 // wrapRoute builds a gin.HandlerFunc from a route. The returned function
@@ -209,12 +225,6 @@ func wrapRoute[Req, Res any](a *API, routeID routeIdentifier, route route[Req, R
 		ctx, cancel := context.WithTimeout(origRequestContext, a.server.options.API.RequestTimeout)
 		defer cancel()
 		c.Request = c.Request.WithContext(ctx)
-
-		if !route.infraVersionHeaderOptional {
-			if _, err := requestVersion(c.Request); err != nil {
-				return err
-			}
-		}
 
 		authned, err := authenticateRequest(c, route.routeSettings, a.server)
 		if err != nil {
@@ -247,11 +257,11 @@ func wrapRoute[Req, Res any](a *API, routeID routeIdentifier, route route[Req, R
 			DBTxn:         tx,
 			Authenticated: authned,
 			DataDB:        a.server.db,
-			Response:      &access.ResponseMetadata{},
+			Response:      &access.Response{HTTPWriter: c.Writer},
 		}
 		c.Set(access.RequestContextKey, rCtx)
 
-		resp, err := route.handler(c, req)
+		resp, err := route.handler(rCtx, req)
 		if err != nil {
 			return err
 		}
@@ -266,12 +276,12 @@ func wrapRoute[Req, Res any](a *API, routeID routeIdentifier, route route[Req, R
 		}
 
 		if !route.omitFromTelemetry {
-			a.t.RouteEvent(c, routeID.path, Properties{"method": strings.ToLower(routeID.method)})
+			a.t.RouteEvent(rCtx, routeID.path, Properties{"method": strings.ToLower(routeID.method)})
 		}
 
 		// TODO: extract all response header/status/body writing to another function
 		if respHeaders, ok := any(resp).(hasResponseHeaders); ok {
-			respHeaders.SetHeaders(c.Writer.Header())
+			respHeaders.SetHeaders(rCtx.Response.HTTPWriter.Header())
 		}
 		if r, ok := any(resp).(isRedirect); ok {
 			c.Redirect(http.StatusPermanentRedirect, r.RedirectURL())
@@ -296,6 +306,32 @@ type statusCoder interface {
 
 type isBlockingRequest interface {
 	IsBlockingRequest() bool
+}
+
+func requestVersion(req *http.Request) (*semver.Version, error) {
+	headerVer := req.Header.Get("Infra-Version")
+	if headerVer == "" {
+		return nil, fmt.Errorf("%w: Infra-Version header is required. The current version is %s", internal.ErrBadRequest, internal.FullVersion())
+	}
+	reqVer, err := semver.NewVersion(headerVer)
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid Infra-Version header: %v. Current version is %s", internal.ErrBadRequest, err, internal.FullVersion())
+	}
+	return reqVer, nil
+}
+
+func handlerForVersion(versions []routeVersion, reqVer *semver.Version) func(c *gin.Context) {
+	if reqVer == nil {
+		return nil
+	}
+
+	for _, v := range versions {
+		if reqVer.GreaterThan(v.version) {
+			continue
+		}
+		return v.handler
+	}
+	return nil
 }
 
 var reflectTypeString = reflect.TypeOf("")
@@ -332,12 +368,14 @@ func responseStatusCode(method string, resp any) int {
 
 func get[Req, Res any](a *API, r *routeGroup, path string, handler HandlerFunc[Req, Res]) {
 	add(a, r, http.MethodGet, path, route[Req, Res]{
-		handler: handler,
-		routeSettings: routeSettings{
-			omitFromTelemetry: true,
-			txnOptions:        &sql.TxOptions{ReadOnly: true},
-		},
+		handler:       handler,
+		routeSettings: defaultRouteSettingsGet,
 	})
+}
+
+var defaultRouteSettingsGet = routeSettings{
+	omitFromTelemetry: true,
+	txnOptions:        &sql.TxOptions{ReadOnly: true},
 }
 
 func post[Req, Res any](a *API, r *routeGroup, path string, handler HandlerFunc[Req, Res]) {
@@ -357,16 +395,24 @@ func del[Req any, Res any](a *API, r *routeGroup, path string, handler HandlerFu
 }
 
 func readRequest(c *gin.Context, req interface{}) error {
-	if err := c.ShouldBindUri(req); err != nil {
-		return fmt.Errorf("%w: %s", internal.ErrBadRequest, err)
+	if len(c.Params) > 0 {
+		params := make(map[string][]string)
+		for _, v := range c.Params {
+			params[v.Key] = []string{v.Value}
+		}
+		if err := binding.Uri.BindUri(params, req); err != nil {
+			return fmt.Errorf("%w: %s", internal.ErrBadRequest, err)
+		}
 	}
 
-	if err := c.ShouldBindQuery(req); err != nil {
-		return fmt.Errorf("%w: %s", internal.ErrBadRequest, err)
+	if len(c.Request.URL.Query()) > 0 {
+		if err := binding.Query.Bind(c.Request, req); err != nil {
+			return fmt.Errorf("%w: %s", internal.ErrBadRequest, err)
+		}
 	}
 
 	if c.Request.Body != nil && c.Request.ContentLength > 0 {
-		if err := c.ShouldBindJSON(req); err != nil {
+		if err := json.NewDecoder(c.Request.Body).Decode(req); err != nil {
 			return fmt.Errorf("%w: %s", internal.ErrBadRequest, err)
 		}
 	}
@@ -392,7 +438,7 @@ func healthHandler(c *gin.Context) {
 func (a *API) notFoundHandler(c *gin.Context) {
 	accept := c.Request.Header.Get("Accept")
 	if strings.HasPrefix(accept, "application/json") {
-		sendAPIError(c, internal.ErrNotFound)
+		sendAPIError(c.Writer, c.Request, internal.ErrNotFound)
 		return
 	}
 
@@ -402,4 +448,22 @@ func (a *API) notFoundHandler(c *gin.Context) {
 	if err != nil {
 		logging.Errorf("%s", err.Error())
 	}
+}
+
+func (a *API) deprecatedRoutes(noAuthnNoOrg *routeGroup) {
+	// CLI clients before v0.14.4 rely on sign-up being false to continue with login
+	type SignupEnabledResponse struct {
+		Enabled bool `json:"enabled"`
+	}
+
+	add(a, noAuthnNoOrg, http.MethodGet, "/api/signup", route[api.EmptyRequest, *SignupEnabledResponse]{
+		handler: func(rCtx access.RequestContext, _ *api.EmptyRequest) (*SignupEnabledResponse, error) {
+			return &SignupEnabledResponse{Enabled: false}, nil
+		},
+		routeSettings: routeSettings{
+			omitFromTelemetry: true,
+			omitFromDocs:      true,
+			txnOptions:        &sql.TxOptions{ReadOnly: true},
+		},
+	})
 }

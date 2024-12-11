@@ -113,7 +113,7 @@ CREATE TABLE access_keys (
     updated_at timestamp with time zone,
     deleted_at timestamp with time zone,
     name text,
-    issued_for bigint,
+    issued_for_id bigint,
     provider_id bigint,
     expires_at timestamp with time zone,
     inactivity_extension bigint,
@@ -121,7 +121,8 @@ CREATE TABLE access_keys (
     key_id text,
     secret_checksum bytea,
     scopes text,
-    organization_id bigint
+    organization_id bigint,
+    issued_for_kind smallint DEFAULT 1
 );
 
 CREATE TABLE credentials (
@@ -193,12 +194,13 @@ CREATE TABLE grants (
     created_at timestamp with time zone,
     updated_at timestamp with time zone,
     deleted_at timestamp with time zone,
-    subject text,
     privilege text,
     resource text,
     created_by bigint,
     organization_id bigint,
-    update_index bigint
+    update_index bigint,
+    subject_id bigint NOT NULL,
+    subject_kind smallint NOT NULL
 );
 
 CREATE TABLE groups (
@@ -239,7 +241,10 @@ CREATE TABLE organizations (
     name text,
     created_by bigint,
     domain text,
-    allowed_domains text DEFAULT ''::text
+    allowed_domains text DEFAULT ''::text,
+    private_jwk bytea,
+    public_jwk bytea,
+    install_id bigint
 );
 
 CREATE TABLE password_reset_tokens (
@@ -254,7 +259,6 @@ CREATE TABLE provider_users (
     identity_id bigint NOT NULL,
     provider_id bigint NOT NULL,
     email text,
-    groups text,
     last_update timestamp with time zone,
     redirect_url text,
     access_token text,
@@ -262,7 +266,8 @@ CREATE TABLE provider_users (
     expires_at timestamp with time zone,
     given_name text DEFAULT ''::text,
     family_name text DEFAULT ''::text,
-    active boolean DEFAULT true
+    active boolean DEFAULT true,
+    groups jsonb
 );
 
 CREATE TABLE providers (
@@ -290,21 +295,6 @@ CREATE SEQUENCE seq_update_index
     NO MINVALUE
     NO MAXVALUE
     CACHE 1;
-
-CREATE TABLE settings (
-    id bigint NOT NULL,
-    created_at timestamp with time zone,
-    updated_at timestamp with time zone,
-    deleted_at timestamp with time zone,
-    private_jwk bytea,
-    public_jwk bytea,
-    lowercase_min bigint DEFAULT 0,
-    uppercase_min bigint DEFAULT 0,
-    number_min bigint DEFAULT 0,
-    symbol_min bigint DEFAULT 0,
-    length_min bigint DEFAULT 8,
-    organization_id bigint
-);
 
 CREATE TABLE user_public_keys (
     id bigint NOT NULL,
@@ -355,15 +345,12 @@ ALTER TABLE ONLY provider_users
 ALTER TABLE ONLY providers
     ADD CONSTRAINT providers_pkey PRIMARY KEY (id);
 
-ALTER TABLE ONLY settings
-    ADD CONSTRAINT settings_pkey PRIMARY KEY (id);
-
 ALTER TABLE ONLY user_public_keys
     ADD CONSTRAINT user_public_keys_pkey PRIMARY KEY (id);
 
 CREATE INDEX idx_access_keys_expires_at ON access_keys USING btree (expires_at);
 
-CREATE UNIQUE INDEX idx_access_keys_issued_for_name ON access_keys USING btree (organization_id, issued_for, name) WHERE (deleted_at IS NULL);
+CREATE UNIQUE INDEX idx_access_keys_issued_for ON access_keys USING btree (organization_id, issued_for_id, name) WHERE (deleted_at IS NULL);
 
 CREATE UNIQUE INDEX idx_access_keys_key_id ON access_keys USING btree (key_id) WHERE (deleted_at IS NULL);
 
@@ -383,7 +370,7 @@ CREATE UNIQUE INDEX idx_emails_providers_identities ON provider_users USING btre
 
 CREATE UNIQUE INDEX idx_encryption_keys_key_id ON encryption_keys USING btree (key_id);
 
-CREATE UNIQUE INDEX idx_grant_srp ON grants USING btree (organization_id, subject, privilege, resource) WHERE (deleted_at IS NULL);
+CREATE UNIQUE INDEX idx_grants_subject_privilege_resource ON grants USING btree (organization_id, subject_id, privilege, resource) WHERE (deleted_at IS NULL);
 
 CREATE INDEX idx_grants_update_index ON grants USING btree (organization_id, update_index);
 
@@ -403,9 +390,9 @@ CREATE UNIQUE INDEX idx_providers_name ON providers USING btree (organization_id
 
 CREATE UNIQUE INDEX idx_user_public_keys_user_fingerprint ON user_public_keys USING btree (fingerprint) WHERE (deleted_at IS NULL);
 
-CREATE UNIQUE INDEX idx_user_ssh_login_name ON identities USING btree (organization_id, ssh_login_name) WHERE (deleted_at IS NULL);
+CREATE INDEX idx_user_public_keys_user_id ON user_public_keys USING btree (user_id) WHERE (deleted_at IS NULL);
 
-CREATE UNIQUE INDEX settings_org_id ON settings USING btree (organization_id) WHERE (deleted_at IS NULL);
+CREATE UNIQUE INDEX idx_user_ssh_login_name ON identities USING btree (organization_id, ssh_login_name) WHERE (deleted_at IS NULL);
 
 CREATE TRIGGER credreq_notify_insert_trigger AFTER INSERT ON destination_credentials FOR EACH ROW EXECUTE FUNCTION destination_credential_insert_notify();
 

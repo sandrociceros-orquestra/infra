@@ -84,6 +84,12 @@ func migrations() []*migrator.Migration {
 		deviceFlowAuthRequestsAddUserIDProviderID(),
 		addDestinationCredentials(),
 		setGoogleSocialLoginDefaultID(),
+		addUserPublicKeyUserIDIndex(),
+		addGrantsSubjectID(),
+		removeSettingsPasswordPolicy(),
+		moveSettingsJWKOrganizations(),
+		addAccessKeyIssuedForKind(),
+		storeProviderUserGroupsArray(),
 		// next one here, then run `go test -run TestMigrations ./internal/server/data -update`
 	}
 }
@@ -1156,6 +1162,216 @@ func setGoogleSocialLoginDefaultID() *migrator.Migration {
 			`, models.InternalGoogleProviderID)
 
 			return err
+		},
+	}
+}
+
+func addUserPublicKeyUserIDIndex() *migrator.Migration {
+	return &migrator.Migration{
+		ID: "2023-01-05T17:33",
+		Migrate: func(tx migrator.DB) error {
+			stmt := `CREATE INDEX IF NOT EXISTS idx_user_public_keys_user_id
+					ON user_public_keys USING btree (user_id) WHERE (deleted_at IS NULL)`
+
+			_, err := tx.Exec(stmt)
+			return err
+		},
+	}
+}
+
+func addGrantsSubjectID() *migrator.Migration {
+	return &migrator.Migration{
+		ID: "2023-01-12T17:00",
+		Migrate: func(tx migrator.DB) error {
+			if !migrator.HasColumn(tx, "grants", "subject") {
+				return nil
+			}
+
+			// Step 1 - Add the new columns
+			_, err := tx.Exec(`
+				ALTER TABLE grants ADD COLUMN IF NOT EXISTS subject_id bigint;
+				ALTER TABLE grants ADD COLUMN IF NOT EXISTS subject_kind smallint;
+			`)
+			if err != nil {
+				return err
+			}
+
+			// Step 2- Migrate the data
+			type grantSubject struct {
+				ID              uid.ID
+				OriginalSubject string
+			}
+
+			rows, err := tx.Query(`SELECT id, subject FROM grants`)
+			if err != nil {
+				return err
+			}
+			grants, err := scanRows(rows, func(g *grantSubject) []any {
+				return []any{&g.ID, &g.OriginalSubject}
+			})
+			if err != nil {
+				return err
+			}
+
+			for _, grant := range grants {
+				var kind int
+				var subjectID uid.ID
+				if strings.HasPrefix(grant.OriginalSubject, "i:") {
+					kind = 1
+				} else {
+					kind = 2
+				}
+				subjectID, err = uid.Parse([]byte(grant.OriginalSubject[2:]))
+				if err != nil {
+					return err
+				}
+
+				_, err = tx.Exec(`UPDATE grants SET subject_id=?, subject_kind=? WHERE id = ?`,
+					subjectID, kind, grant.ID)
+				if err != nil {
+					return err
+				}
+			}
+
+			// Step 3 - Remove the old column, add a new index, and NOT NULL
+			_, err = tx.Exec(`
+				ALTER TABLE grants DROP COLUMN IF EXISTS subject;
+				ALTER TABLE grants ALTER COLUMN subject_id SET NOT NULL;
+				ALTER TABLE grants ALTER COLUMN subject_kind SET NOT NULL;
+				CREATE UNIQUE INDEX idx_grants_subject_privilege_resource ON grants
+				    USING btree (organization_id, subject_id, privilege, resource) WHERE (deleted_at IS NULL);
+			`)
+			return err
+		},
+	}
+}
+
+func removeSettingsPasswordPolicy() *migrator.Migration {
+	return &migrator.Migration{
+		ID: "2023-01-17T11:36",
+		Migrate: func(tx migrator.DB) error {
+			_, err := tx.Exec(`
+				ALTER TABLE settings
+					DROP COLUMN IF EXISTS length_min,
+					DROP COLUMN IF EXISTS lowercase_min,
+					DROP COLUMN IF EXISTS uppercase_min,
+					DROP COLUMN IF EXISTS number_min,
+					DROP COLUMN IF EXISTS symbol_min;`)
+			return err
+		},
+	}
+}
+
+func moveSettingsJWKOrganizations() *migrator.Migration {
+	return &migrator.Migration{
+		ID: "2023-01-18T10:26",
+		Migrate: func(tx migrator.DB) error {
+			if migrator.HasTable(tx, "settings") {
+				_, err := tx.Exec(`
+					ALTER TABLE organizations
+						ADD COLUMN IF NOT EXISTS private_jwk bytea,
+						ADD COLUMN IF NOT EXISTS public_jwk bytea,
+						ADD COLUMN IF NOT EXISTS install_id bigint;
+					UPDATE organizations
+						SET private_jwk = settings.private_jwk, public_jwk = settings.public_jwk, install_id = settings.id
+						FROM settings
+						WHERE organizations.id = settings.organization_id;
+					DROP TABLE IF EXISTS settings;`)
+				return err
+			}
+
+			return nil
+		},
+	}
+}
+
+func addAccessKeyIssuedForKind() *migrator.Migration {
+	return &migrator.Migration{
+		ID: "2023-01-25T11:00",
+		Migrate: func(tx migrator.DB) error {
+			if !migrator.HasColumn(tx, "access_keys", "issued_for") {
+				return nil
+			}
+			stmt := `
+				DROP INDEX IF EXISTS idx_access_keys_issued_for_name;
+				ALTER TABLE access_keys RENAME COLUMN issued_for TO issued_for_id;
+				ALTER TABLE access_keys ADD COLUMN IF NOT EXISTS issued_for_kind smallint DEFAULT 1;
+				UPDATE access_keys SET issued_for_kind = 2 WHERE issued_for_id = provider_id;
+			`
+			if _, err := tx.Exec(stmt); err != nil {
+				return fmt.Errorf("add access key issued_for_kind and issued_for_id: %w", err)
+			}
+
+			stmt = `SELECT id FROM identities WHERE deleted_at IS NULL AND name = 'connector';`
+			rows, err := tx.Query(stmt)
+			if err != nil {
+				return err
+			}
+			connectorIDs, err := scanRows(rows, func(id *uid.ID) []any {
+				return []any{id}
+			})
+			if err != nil {
+				return fmt.Errorf("read connector identity rows: %w", err)
+			}
+			if len(connectorIDs) > 0 {
+				query := querybuilder.New(`UPDATE access_keys`)
+				query.B(`SET issued_for_kind = ?`, models.IssuedForKindOrganization)
+				query.B(`WHERE issued_for_id IN`)
+				queryInClause(query, connectorIDs)
+				_, err := tx.Exec(query.String(), query.Args...)
+				if err != nil {
+					return fmt.Errorf("set connector key issued_for_kind organization: %w", err)
+				}
+			}
+			if _, err := tx.Exec(`CREATE UNIQUE INDEX idx_access_keys_issued_for ON access_keys USING btree (organization_id, issued_for_id, name) WHERE (deleted_at IS NULL);`); err != nil {
+				return fmt.Errorf("create access key issued_for index: %w", err)
+			}
+			return nil
+		},
+	}
+}
+
+func storeProviderUserGroupsArray() *migrator.Migration {
+	return &migrator.Migration{
+		ID: "2023-01-26T13:37",
+		Migrate: func(tx migrator.DB) error {
+			var groupType string
+			if err := tx.QueryRow(`SELECT pg_typeof(groups) FROM provider_users LIMIT 1;`).Scan(&groupType); err != nil {
+				return err
+			}
+			if groupType == "jsonb" {
+				// this migration has already been performed
+				return nil
+			}
+			// copy the groups string to the new groupsArray column, this could be a large operation if there are a lot of users
+			type userGroups struct {
+				IdentityID uid.ID
+				ProviderID uid.ID
+				Groups     models.CommaSeparatedStrings
+			}
+			rows, err := tx.Query(`SELECT identity_id, provider_id, groups FROM provider_users`)
+			if err != nil {
+				return err
+			}
+			users, err := scanRows(rows, func(u *userGroups) []any {
+				return []any{&u.IdentityID, &u.ProviderID, &u.Groups}
+			})
+			if err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`ALTER TABLE provider_users DROP COLUMN IF EXISTS groups;`); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`ALTER TABLE provider_users ADD COLUMN IF NOT EXISTS groups jsonb;`); err != nil {
+				return err
+			}
+			for _, u := range users {
+				groups := models.JSONB(u.Groups)
+				if _, err := tx.Exec(`UPDATE provider_users SET groups = ? WHERE identity_id = ? AND provider_id = ?`, groups, u.IdentityID, u.ProviderID); err != nil {
+					return err
+				}
+			}
+			return nil
 		},
 	}
 }

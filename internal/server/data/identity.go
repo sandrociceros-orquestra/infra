@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ssoroka/slice"
 	"golang.org/x/exp/maps"
+	"golang.org/x/exp/slices"
 
 	"github.com/infrahq/infra/internal"
 	"github.com/infrahq/infra/internal/generate"
@@ -34,44 +34,131 @@ func (i *identitiesTable) ScanFields() []any {
 	return []any{&i.CreatedAt, &i.CreatedBy, &i.DeletedAt, &i.ID, &i.LastSeenAt, &i.Name, &i.OrganizationID, &i.SSHLoginName, &i.UpdatedAt, &i.VerificationToken, &i.Verified}
 }
 
-func AssignIdentityToGroups(tx WriteTxn, user *models.Identity, provider *models.Provider, newGroups []string) error {
-	pu, err := GetProviderUser(tx, provider.ID, user.ID)
+// diff compares two string slices (x and y), it returns a slice of strings that exist in x that do not exist in y
+func diff(x, y []string) []string {
+	// this modifies the order of x and y, but its ok in this case since the order of the groups assigned to a user does not matter
+	slices.Sort(x)
+	slices.Sort(y)
+
+	difference := []string{}
+
+	for _, val := range x {
+		_, contains := slices.BinarySearch(y, val)
+		if !contains {
+			difference = append(difference, val)
+		}
+	}
+
+	return difference
+}
+
+func deduplicate(groups []string) []string {
+	uniqueGroups := make(map[string]bool)
+	for _, g := range groups {
+		uniqueGroups[g] = true
+	}
+	return maps.Keys(uniqueGroups)
+}
+
+// AssignIdentityToGroups updates the identity's group membership relations based on the provider user's groups
+// and returns the identity's current groups after the update has persisted them
+func AssignIdentityToGroups(tx WriteTxn, user *models.ProviderUser, newGroups []string) ([]models.Group, error) {
+	identity, err := GetIdentity(tx, GetIdentityOptions{ByID: user.IdentityID, LoadGroups: true})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	oldGroups := pu.Groups
-	groupsToBeRemoved := slice.Subtract(oldGroups, newGroups)
-	groupsToBeAdded := slice.Subtract(newGroups, oldGroups)
+	newGroups = deduplicate(newGroups)
+	oldGroups := user.Groups
 
-	pu.Groups = newGroups
-	pu.LastUpdate = time.Now().UTC()
-	if err := UpdateProviderUser(tx, pu); err != nil {
-		return fmt.Errorf("save: %w", err)
+	groupsToBeRemoved := diff(oldGroups, newGroups)
+	groupsToBeAdded := diff(newGroups, oldGroups)
+
+	user.Groups = newGroups
+	user.LastUpdate = time.Now().UTC()
+	if err := UpdateProviderUser(tx, user); err != nil {
+		return nil, fmt.Errorf("save: %w", err)
 	}
+
+	toRemoveMap, err := listGroupIDsFromNames(tx, groupsToBeRemoved)
+	if err != nil {
+		return nil, err
+	}
+	idsToRemove := maps.Values(toRemoveMap)
 
 	// remove user from groups
 	if len(groupsToBeRemoved) > 0 {
 		query := querybuilder.New(`DELETE FROM identities_groups`)
-		query.B(`WHERE identity_id = ?`, user.ID)
-		query.B(`AND group_id in (`)
-		query.B(`SELECT id FROM groups WHERE organization_id = ?`, tx.OrganizationID())
-		query.B(`AND name IN`)
-		queryInClause(query, groupsToBeRemoved)
-		query.B(`)`)
+		query.B(`WHERE identity_id = ?`, user.IdentityID)
+		query.B(`AND group_id IN`)
+		queryInClause(query, idsToRemove)
 		if _, err := tx.Exec(query.String(), query.Args...); err != nil {
-			return err
+			return nil, err
 		}
 		for _, name := range groupsToBeRemoved {
-			for i, g := range user.Groups {
+			for i, g := range identity.Groups {
 				if g.Name == name {
 					// remove from list
-					user.Groups = append(user.Groups[:i], user.Groups[i+1:]...)
+					identity.Groups = append(identity.Groups[:i], identity.Groups[i+1:]...)
 				}
 			}
 		}
 	}
 
+	addIDs, err := listGroupIDsFromNames(tx, groupsToBeAdded)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, name := range groupsToBeAdded {
+		// find or create group
+		groupID, found := addIDs[name]
+		if !found {
+			group := &models.Group{
+				Name:              name,
+				CreatedByProvider: user.ProviderID,
+			}
+
+			if err = CreateGroup(tx, group); err != nil {
+				return nil, fmt.Errorf("create group: %w", err)
+			}
+			groupID = group.ID
+			// add to the map so we can use the IDs below
+			addIDs[name] = groupID
+		}
+
+		rows, err := tx.Query("SELECT identity_id FROM identities_groups WHERE identity_id = ? AND group_id = ?", user.IdentityID, groupID)
+		if err != nil {
+			return nil, err
+		}
+		ids, err := scanRows(rows, func(item *uid.ID) []any {
+			return []any{item}
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		if len(ids) == 0 {
+			// add user to group
+			_, err = tx.Exec("INSERT INTO identities_groups (identity_id, group_id) VALUES (?, ?)", user.IdentityID, groupID)
+			if err != nil {
+				return nil, fmt.Errorf("insert: %w", handleError(err))
+			}
+			identity.Groups = append(identity.Groups,
+				models.Group{
+					Model: models.Model{ID: groupID},
+					OrganizationMember: models.OrganizationMember{
+						OrganizationID: identity.OrganizationID,
+					},
+					Name: name,
+				})
+		}
+	}
+
+	return identity.Groups, nil
+}
+
+func listGroupIDsFromNames(tx ReadTxn, names []string) (map[string]uid.ID, error) {
 	type idNamePair struct {
 		ID   uid.ID
 		Name string
@@ -81,64 +168,22 @@ func AssignIdentityToGroups(tx WriteTxn, user *models.Identity, provider *models
 	query.B(`WHERE deleted_at is null`)
 	query.B(`AND organization_id = ?`, tx.OrganizationID())
 	query.B(`AND name IN`)
-	queryInClause(query, groupsToBeAdded)
+	queryInClause(query, names)
 	rows, err := tx.Query(query.String(), query.Args...)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	addIDs, err := scanRows(rows, func(item *idNamePair) []any {
+	pairs, err := scanRows(rows, func(item *idNamePair) []any {
 		return []any{&item.ID, &item.Name}
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	for _, name := range groupsToBeAdded {
-		// find or create group
-		var groupID uid.ID
-		found := false
-		for _, obj := range addIDs {
-			if obj.Name == name {
-				found = true
-				groupID = obj.ID
-				break
-			}
-		}
-		if !found {
-			group := &models.Group{
-				Name:              name,
-				CreatedByProvider: provider.ID,
-			}
-
-			if err = CreateGroup(tx, group); err != nil {
-				return fmt.Errorf("create group: %w", err)
-			}
-			groupID = group.ID
-		}
-
-		rows, err := tx.Query("SELECT identity_id FROM identities_groups WHERE identity_id = ? AND group_id = ?", user.ID, groupID)
-		if err != nil {
-			return err
-		}
-		ids, err := scanRows(rows, func(item *uid.ID) []any {
-			return []any{item}
-		})
-		if err != nil {
-			return err
-		}
-
-		if len(ids) == 0 {
-			// add user to group
-			_, err = tx.Exec("INSERT INTO identities_groups (identity_id, group_id) VALUES (?, ?)", user.ID, groupID)
-			if err != nil {
-				return fmt.Errorf("insert: %w", handleError(err))
-			}
-		}
-
-		user.Groups = append(user.Groups, models.Group{Model: models.Model{ID: groupID}, Name: name})
+	result := make(map[string]uid.ID, len(pairs))
+	for _, item := range pairs {
+		result[item.Name] = item.ID
 	}
-
-	return nil
+	return result, nil
 }
 
 func CreateIdentity(tx WriteTxn, identity *models.Identity) error {
@@ -282,6 +327,10 @@ type GetIdentityOptions struct {
 	LoadGroups     bool
 	LoadProviders  bool
 	LoadPublicKeys bool
+
+	// FromOrganization is the organization ID of the provider. When set to a
+	// non-zero value the organization ID from the transaction is ignored.
+	FromOrganization uid.ID
 }
 
 func GetIdentity(tx ReadTxn, opts GetIdentityOptions) (*models.Identity, error) {
@@ -293,7 +342,14 @@ func GetIdentity(tx ReadTxn, opts GetIdentityOptions) (*models.Identity, error) 
 	query.B(columnsForSelect(identity))
 	query.B("FROM")
 	query.B(identity.Table())
-	query.B("WHERE deleted_at IS NULL AND organization_id = ?", tx.OrganizationID())
+	query.B("WHERE deleted_at IS NULL")
+
+	orgID := opts.FromOrganization
+	if orgID == 0 {
+		orgID = tx.OrganizationID()
+	}
+	query.B("AND organization_id = ?", orgID)
+
 	switch {
 	case opts.ByID != 0:
 		query.B("AND identities.id = ?", opts.ByID)
@@ -369,12 +425,10 @@ func SetIdentityVerified(tx WriteTxn, token string) error {
 type ListIdentityOptions struct {
 	ByID                   uid.ID
 	ByIDs                  []uid.ID
-	ByNotIDs               []uid.ID
 	ByName                 string
 	ByPublicKeyFingerprint string
 	ByNotName              string
 	ByGroupID              uid.ID
-	CreatedBy              uid.ID
 	Pagination             *Pagination
 	LoadGroups             bool
 	LoadProviders          bool
@@ -382,9 +436,6 @@ type ListIdentityOptions struct {
 }
 
 func ListIdentities(tx ReadTxn, opts ListIdentityOptions) ([]models.Identity, error) {
-	if len(opts.ByNotIDs) > 0 && opts.CreatedBy == 0 {
-		return nil, fmt.Errorf("ListIdentities by 'not IDs' requires 'created by'")
-	}
 	identities := &identitiesTable{}
 	query := querybuilder.New("SELECT")
 	query.B(columnsForSelect(identities))
@@ -417,13 +468,6 @@ func ListIdentities(tx ReadTxn, opts ListIdentityOptions) ([]models.Identity, er
 	}
 	if opts.ByGroupID != 0 {
 		query.B("AND identities_groups.group_id = ?", opts.ByGroupID)
-	}
-	if opts.CreatedBy != 0 {
-		query.B("AND identities.created_by = ?", opts.CreatedBy)
-		if len(opts.ByNotIDs) > 0 {
-			query.B("AND identities.id NOT IN ")
-			queryInClause(query, opts.ByNotIDs)
-		}
 	}
 	query.B("ORDER BY identities.name ASC")
 	if opts.Pagination != nil {
@@ -601,99 +645,107 @@ func UpdateIdentity(tx WriteTxn, identity *models.Identity) error {
 	return update(tx, (*identitiesTable)(identity))
 }
 
+// UpdateIdentityLastSeenAt sets user.LastSeenAt to now and then updates the
+// user row in the database. Updates are throttled to once every 2 seconds.
+// If the user was updated recently, or the database row is already locked, the
+// update will be skipped.
+//
+// Unlike most functions in this package, this function uses user.OrganizationID
+// not tx.OrganizationID.
+func UpdateIdentityLastSeenAt(tx WriteTxn, user *models.Identity) error {
+	if time.Since(user.LastSeenAt) < lastSeenUpdateThreshold {
+		return nil
+	}
+
+	origUpdatedAt := user.UpdatedAt
+	user.LastSeenAt = time.Now()
+	if err := user.OnUpdate(); err != nil {
+		return err
+	}
+
+	table := (*identitiesTable)(user)
+	query := querybuilder.New("UPDATE identities SET")
+	query.B(columnsForUpdate(table), table.Values()...)
+	query.B("WHERE deleted_at is null")
+	query.B("AND organization_id = ?", user.OrganizationID)
+	// only update if the row has not changed since the SELECT
+	query.B("AND updated_at = ?", origUpdatedAt)
+	query.B("AND id IN (SELECT id from identities WHERE id = ? FOR UPDATE SKIP LOCKED)", table.Primary())
+
+	_, err := tx.Exec(query.String(), query.Args...)
+	return handleError(err)
+}
+
 type DeleteIdentitiesOptions struct {
 	ByID         uid.ID
 	ByIDs        []uid.ID
-	ByNotIDs     []uid.ID
-	CreatedBy    uid.ID
 	ByProviderID uid.ID
 }
 
 func DeleteIdentities(tx WriteTxn, opts DeleteIdentitiesOptions) error {
-	if opts.ByProviderID == 0 {
-		return fmt.Errorf("DeleteIdentities requires a provider ID")
+	if opts.ByID == 0 && len(opts.ByIDs) == 0 {
+		return fmt.Errorf("DeleteIdentities requires an ID")
 	}
-	listOpts := ListIdentityOptions{
-		ByID:      opts.ByID,
-		ByIDs:     opts.ByIDs,
-		ByNotIDs:  opts.ByNotIDs,
-		CreatedBy: opts.CreatedBy,
-	}
-	toDelete, err := ListIdentities(tx, listOpts)
-	if err != nil {
-		return err
+	ids := opts.ByIDs
+	if opts.ByID != 0 {
+		ids = append(ids, opts.ByID)
 	}
 
-	ids, err := deleteReferencesToIdentities(tx, opts.ByProviderID, toDelete)
-	if err != nil {
+	if err := deleteReferencesToIdentities(tx, ids); err != nil {
 		return fmt.Errorf("remove identities: %w", err)
 	}
 
-	if len(ids) > 0 {
-		query := querybuilder.New("UPDATE identities")
-		query.B("SET deleted_at = ?", time.Now())
-		query.B("WHERE id IN")
-		queryInClause(query, ids)
-		query.B("AND organization_id = ?", tx.OrganizationID())
-
-		_, err := tx.Exec(query.String(), query.Args...)
-		return err
-	}
-
-	return nil
+	query := querybuilder.New("UPDATE identities")
+	query.B("SET deleted_at = ?", time.Now())
+	query.B("WHERE id IN")
+	queryInClause(query, ids)
+	query.B("AND organization_id = ?", tx.OrganizationID())
+	_, err := tx.Exec(query.String(), query.Args...)
+	return err
 }
 
-func deleteReferencesToIdentities(tx WriteTxn, providerID uid.ID, toDelete []models.Identity) (unreferencedIdentityIDs []uid.ID, err error) {
-	for _, i := range toDelete {
-		if err := DeleteAccessKeys(tx, DeleteAccessKeysOptions{ByIssuedForID: i.ID, ByProviderID: providerID}); err != nil {
-			return nil, fmt.Errorf("delete identity access keys: %w", err)
+// deleteReferencesToIdentities removes all entities (keys, grants, etc.) that reference an identity
+func deleteReferencesToIdentities(tx WriteTxn, ids []uid.ID) error {
+	for _, id := range ids {
+		if err := DeleteAccessKeys(tx, DeleteAccessKeysOptions{ByIssuedForID: id}); err != nil {
+			return fmt.Errorf("delete identity access keys: %w", err)
 		}
-		if err := DeleteUserPublicKeys(tx, i.ID); err != nil {
-			return nil, fmt.Errorf("delete identity public keys: %w", err)
-		}
-
-		if providerID == InfraProvider(tx).ID {
-			// if an identity does not have credentials in the Infra provider this won't be found, but we can proceed
-			credential, err := GetCredentialByUserID(tx, i.ID)
-			if err != nil && !errors.Is(err, internal.ErrNotFound) {
-				return nil, fmt.Errorf("get delete identity creds: %w", err)
-			}
-			if credential != nil {
-				err := DeleteCredential(tx, credential.ID)
-				if err != nil {
-					return nil, fmt.Errorf("delete identity creds: %w", err)
-				}
-			}
-		}
-		if err := DeleteProviderUsers(tx, DeleteProviderUsersOptions{ByIdentityID: i.ID, ByProviderID: providerID}); err != nil {
-			return nil, fmt.Errorf("remove provider user: %w", err)
+		if err := DeleteUserPublicKeys(tx, id); err != nil {
+			return fmt.Errorf("delete identity public keys: %w", err)
 		}
 
-		// if this identity no longer exists in any identity providers then remove all their references
-		user, err := GetIdentity(tx, GetIdentityOptions{ByID: i.ID, LoadProviders: true})
+		// if an identity does not have credentials in the Infra provider this won't be found, but we can proceed
+		credential, err := GetCredentialByUserID(tx, id)
+		if err != nil && !errors.Is(err, internal.ErrNotFound) {
+			return fmt.Errorf("get delete identity creds: %w", err)
+		}
+		if credential != nil {
+			err := DeleteCredential(tx, credential.ID)
+			if err != nil {
+				return fmt.Errorf("delete identity creds: %w", err)
+			}
+		}
+
+		if err := DeleteProviderUsers(tx, DeleteProviderUsersOptions{ByIdentityID: id}); err != nil {
+			return fmt.Errorf("remove provider user: %w", err)
+		}
+
+		groups, err := ListGroups(tx, ListGroupsOptions{ByGroupMember: id})
 		if err != nil {
-			return nil, fmt.Errorf("check user providers: %w", err)
+			return fmt.Errorf("list groups for identity: %w", err)
 		}
-
-		if len(user.Providers) == 0 {
-			groups, err := ListGroups(tx, ListGroupsOptions{ByGroupMember: i.ID})
+		for _, group := range groups {
+			err = RemoveUsersFromGroup(tx, group.ID, []uid.ID{id})
 			if err != nil {
-				return nil, fmt.Errorf("list groups for identity: %w", err)
+				return fmt.Errorf("delete group membership for identity: %w", err)
 			}
-			for _, group := range groups {
-				err = RemoveUsersFromGroup(tx, group.ID, []uid.ID{i.ID})
-				if err != nil {
-					return nil, fmt.Errorf("delete group membership for identity: %w", err)
-				}
-			}
-			err = DeleteGrants(tx, DeleteGrantsOptions{BySubject: uid.NewIdentityPolymorphicID(i.ID)})
-			if err != nil {
-				return nil, fmt.Errorf("delete identity creds: %w", err)
-			}
-			unreferencedIdentityIDs = append(unreferencedIdentityIDs, user.ID)
+		}
+		err = DeleteGrants(tx, DeleteGrantsOptions{BySubject: models.NewSubjectForUser(id)})
+		if err != nil {
+			return fmt.Errorf("delete identity creds: %w", err)
 		}
 	}
-	return unreferencedIdentityIDs, nil
+	return nil
 }
 
 func CountAllIdentities(tx ReadTxn) (int64, error) {

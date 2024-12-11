@@ -6,7 +6,6 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -15,16 +14,15 @@ import (
 	"time"
 
 	backoff "github.com/cenkalti/backoff/v4"
-	"github.com/gin-gonic/gin"
 	"github.com/goware/urlx"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/rs/zerolog"
 	"golang.org/x/sync/errgroup"
 	rbacv1 "k8s.io/api/rbac/v1"
 
 	"github.com/infrahq/infra/api"
 	"github.com/infrahq/infra/internal"
 	"github.com/infrahq/infra/internal/cmd/types"
-	"github.com/infrahq/infra/internal/ginutil"
 	"github.com/infrahq/infra/internal/kubernetes"
 	"github.com/infrahq/infra/internal/logging"
 	"github.com/infrahq/infra/internal/repeat"
@@ -64,6 +62,17 @@ type Options struct {
 	// Kubernetes specific options below here
 	CACert types.StringOrFile
 	CAKey  types.StringOrFile
+
+	// Addrs holds the addresses that HTTP servers use to listen for requests.
+	// When the caller sets Addrs to a non-nil pointer, the Available chan
+	// must be set as well. The addresses will be set by Run, and the
+	// Available channel will be closed to indicate the values were set.
+	Addrs *Addrs `json:"-"`
+}
+
+type Addrs struct {
+	Available chan struct{}
+	HTTPS     net.Addr
 }
 
 type ServerOptions struct {
@@ -177,7 +186,7 @@ func runKubernetesConnector(ctx context.Context, options Options) error {
 		Help:      "A histogram of duration, in seconds, performing HTTP requests.",
 		Buckets:   prometheus.ExponentialBuckets(0.001, 2, 15),
 	}, []string{"host", "method", "path", "status"})
-	promRegistry.MustRegister(responseDuration)
+	promRegistry.MustRegister(responseDuration, metrics.RequestDuration)
 
 	client := options.APIClient()
 	client.OnUnauthorized = func() {
@@ -239,11 +248,8 @@ func runKubernetesConnector(ctx context.Context, options Options) error {
 		}
 	})
 
-	ginutil.SetMode()
-	router := gin.New()
-	router.GET("/healthz", func(c *gin.Context) {
-		c.Status(http.StatusOK)
-	})
+	router := http.NewServeMux()
+	router.HandleFunc("/healthz", healthHandler)
 
 	kubeAPIAddr, err := urlx.Parse(k8s.Config.Host)
 	if err != nil {
@@ -262,7 +268,7 @@ func runKubernetesConnector(ctx context.Context, options Options) error {
 		MinVersion: tls.VersionTLS12,
 	}
 
-	httpErrorLog := log.New(logging.NewFilteredHTTPLogger(), "", 0)
+	httpErrorLog := logging.HTTPErrorLog(zerolog.WarnLevel)
 
 	proxy := httputil.NewSingleHostReverseProxy(kubeAPIAddr)
 	proxy.Transport = proxyTransport
@@ -284,10 +290,8 @@ func runKubernetesConnector(ctx context.Context, options Options) error {
 		return err
 	})
 
-	healthOnlyRouter := gin.New()
-	healthOnlyRouter.GET("/healthz", func(c *gin.Context) {
-		c.Status(http.StatusOK)
-	})
+	healthOnlyRouter := http.NewServeMux()
+	healthOnlyRouter.HandleFunc("/healthz", healthHandler)
 
 	plaintextServer := &http.Server{
 		ReadHeaderTimeout: 30 * time.Second,
@@ -306,10 +310,7 @@ func runKubernetesConnector(ctx context.Context, options Options) error {
 	})
 
 	authn := newAuthenticator(options)
-	router.Use(
-		metrics.Middleware(promRegistry),
-		proxyMiddleware(proxy, authn, k8s.Config.BearerToken),
-	)
+	router.HandleFunc("/", proxyMiddleware(proxy, authn, k8s.Config.BearerToken))
 	tlsServer := &http.Server{
 		ReadHeaderTimeout: 30 * time.Second,
 		ReadTimeout:       60 * time.Second,
@@ -321,13 +322,25 @@ func runKubernetesConnector(ctx context.Context, options Options) error {
 
 	logging.Infof("starting infra connector (%s) - http:%s https:%s metrics:%s", internal.FullVersion(), plaintextServer.Addr, tlsServer.Addr, metricsServer.Addr)
 
+	l, err := net.Listen("tcp", options.Addr.HTTPS)
+	if err != nil {
+		return err
+	}
+	if options.Addrs != nil {
+		options.Addrs.HTTPS = l.Addr()
+	}
+
 	group.Go(func() error {
-		err = tlsServer.ListenAndServeTLS("", "")
+		err = tlsServer.ServeTLS(l, "", "")
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
 		return err
 	})
+
+	if options.Addrs != nil {
+		close(options.Addrs.Available)
+	}
 
 	// wait for shutdown signal
 	<-ctx.Done()
@@ -350,6 +363,14 @@ func runKubernetesConnector(ctx context.Context, options Options) error {
 		return nil
 	}
 	return err
+}
+
+func healthHandler(resp http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		resp.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	resp.WriteHeader(http.StatusOK)
 }
 
 func httpTransportFromOptions(opts ServerOptions) *http.Transport {

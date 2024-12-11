@@ -1,7 +1,7 @@
 package server
 
 import (
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -22,10 +22,10 @@ func TestWriteOpenAPIDocToFile(t *testing.T) {
 	routes := s.GenerateRoutes()
 
 	filename := filepath.Join(t.TempDir(), "openapi3.json")
-	err := WriteOpenAPIDocToFile(routes.OpenAPIDocument, "0.0.0", filename)
+	err := WriteOpenAPIDocToFile(routes.OpenAPIDocument, filename)
 	assert.NilError(t, err)
 
-	actual, err := ioutil.ReadFile(filename)
+	actual, err := os.ReadFile(filename)
 	assert.NilError(t, err)
 	golden.Assert(t, string(actual), "../../../docs/api/openapi3.json")
 }
@@ -38,5 +38,4 @@ func patchProductVersion(t *testing.T, version string) {
 	t.Cleanup(func() {
 		productVersion = orig
 	})
-
 }

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/infrahq/infra/internal/openapi3"
 )
 
 type StringRule struct {
@@ -27,16 +27,12 @@ type StringRule struct {
 	// FirstCharacterRange is a list of character ranges. The first rune in
 	// value must be within one of these ranges.
 	FirstCharacterRange []CharRange
-}
 
-func String(name, value string, minLength, maxLength int, charset []CharRange) StringRule {
-	return StringRule{
-		Name:            name,
-		Value:           value,
-		MinLength:       minLength,
-		MaxLength:       maxLength,
-		CharacterRanges: charset,
-	}
+	// RequiredCharacters must be present in the string
+	RequiredCharacters []rune
+
+	// the string cannot be one of these string
+	DenyList []string
 }
 
 type CharRange struct {
@@ -55,15 +51,14 @@ func (r CharRange) String() string {
 }
 
 var (
-	AlphabetLower      = CharRange{Low: 'a', High: 'z'}
-	AlphabetUpper      = CharRange{Low: 'A', High: 'Z'}
-	Numbers            = CharRange{Low: '0', High: '9'}
-	Dash               = CharRange{Low: '-', High: '-'}
-	Underscore         = CharRange{Low: '_', High: '_'}
-	Dot                = CharRange{Low: '.', High: '.'}
-	AtSign             = CharRange{Low: '@', High: '@'}
-	AlphaNumeric       = []CharRange{AlphabetLower, AlphabetUpper, Numbers}
-	DeviceFlowUserCode = []CharRange{{Low: 'B', High: 'D'}, {Low: 'F', High: 'H'}, {Low: 'J', High: 'N'}, {Low: 'P', High: 'T'}, {Low: 'V', High: 'X'}, {Low: 'Z', High: 'Z'}}
+	AlphabetLower = CharRange{Low: 'a', High: 'z'}
+	AlphabetUpper = CharRange{Low: 'A', High: 'Z'}
+	Numbers       = CharRange{Low: '0', High: '9'}
+	Dash          = CharRange{Low: '-', High: '-'}
+	Underscore    = CharRange{Low: '_', High: '_'}
+	Dot           = CharRange{Low: '.', High: '.'}
+	AtSign        = CharRange{Low: '@', High: '@'}
+	AlphaNumeric  = []CharRange{AlphabetLower, AlphabetUpper, Numbers}
 )
 
 func (s StringRule) DescribeSchema(parent *openapi3.Schema) {
@@ -115,6 +110,20 @@ func (s StringRule) Validate() *Failure {
 				add("character %q at position %v is not allowed", c, i)
 				break
 			}
+		}
+	}
+
+	for _, c := range s.RequiredCharacters {
+		if !strings.ContainsRune(value, c) {
+			add("%q is required in value", c)
+			break
+		}
+	}
+
+	for _, deny := range s.DenyList {
+		if value == deny {
+			add("%q is not an allowed value", value)
+			break
 		}
 	}
 

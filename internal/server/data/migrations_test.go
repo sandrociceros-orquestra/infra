@@ -5,7 +5,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +20,7 @@ import (
 
 	"github.com/infrahq/infra/internal/logging"
 	"github.com/infrahq/infra/internal/server/data/migrator"
+	"github.com/infrahq/infra/internal/server/data/querybuilder"
 	"github.com/infrahq/infra/internal/server/data/schema"
 	"github.com/infrahq/infra/internal/server/models"
 	"github.com/infrahq/infra/internal/testing/database"
@@ -57,7 +57,7 @@ func TestMigrations(t *testing.T) {
 
 		if index == 0 {
 			filename := fmt.Sprintf("testdata/migrations/%v-postgres.sql", tc.label.Name)
-			raw, err := ioutil.ReadFile(filename)
+			raw, err := os.ReadFile(filename)
 			assert.NilError(t, err)
 
 			_, err = db.Exec(string(raw))
@@ -271,40 +271,47 @@ VALUES (12345, '2022-07-05 00:41:49.143574', '2022-07-05 01:41:49.143574Z', 'the
 				assert.NilError(t, err)
 			},
 			expected: func(t *testing.T, db WriteTxn) {
+				type grant struct {
+					ID        uid.ID
+					Subject   string
+					Resource  string
+					Privilege string
+				}
+
 				stmt := `SELECT id, subject, resource, privilege FROM grants`
 				rows, err := db.Query(stmt)
 				assert.NilError(t, err)
 				defer rows.Close()
 
-				var actual []models.Grant
+				var actual []grant
 				for rows.Next() {
-					var g models.Grant
+					var g grant
 					err := rows.Scan(&g.ID, &g.Subject, &g.Resource, &g.Privilege)
 					assert.NilError(t, err)
 					actual = append(actual, g)
 				}
 
-				expected := []models.Grant{
+				expected := []grant{
 					{
-						Model:     models.Model{ID: 10100},
+						ID:        10100,
 						Subject:   "i:aaa",
 						Resource:  "infra",
 						Privilege: "admin",
 					},
 					{
-						Model:     models.Model{ID: 10102},
+						ID:        10102,
 						Subject:   "i:aaa",
 						Resource:  "other",
 						Privilege: "admin",
 					},
 					{
-						Model:     models.Model{ID: 10103},
+						ID:        10103,
 						Subject:   "i:aaa",
 						Resource:  "infra",
 						Privilege: "view",
 					},
 					{
-						Model:     models.Model{ID: 10104},
+						ID:        10104,
 						Subject:   "i:aab",
 						Resource:  "infra",
 						Privilege: "admin",
@@ -408,17 +415,15 @@ INSERT INTO provider_users (identity_id, provider_id, id, created_at, updated_at
 					LIMIT 1
 				`)
 
-				var settings models.Settings
-				err := row.Scan(
-					&settings.LowercaseMin,
-					&settings.UppercaseMin,
-					&settings.NumberMin,
-					&settings.SymbolMin,
-					&settings.LengthMin,
-				)
+				var lengthMin, lowercaseMin, uppercaseMin, numberMin, symbolMin int
+
+				err := row.Scan(&lowercaseMin, &uppercaseMin, &numberMin, &symbolMin, &lengthMin)
 				assert.NilError(t, err)
-				expected := models.Settings{LengthMin: 8}
-				assert.DeepEqual(t, settings, expected)
+				assert.Equal(t, lengthMin, 8)
+				assert.Equal(t, lowercaseMin, 0)
+				assert.Equal(t, uppercaseMin, 0)
+				assert.Equal(t, numberMin, 0)
+				assert.Equal(t, symbolMin, 0)
 			},
 		},
 		{
@@ -482,12 +487,17 @@ INSERT INTO providers(id, name) VALUES (12345, 'okta');
 				}
 				assert.DeepEqual(t, p, expectedProvider)
 
+				type modelsSettings struct {
+					models.Model
+					models.OrganizationMember
+				}
+
 				stmt = `SELECT id, organization_id FROM settings;`
-				s := &models.Settings{}
+				s := &modelsSettings{}
 				err = db.QueryRow(stmt).Scan(&s.ID, &s.OrganizationID)
 				assert.NilError(t, err)
 
-				expectedSettings := &models.Settings{
+				expectedSettings := &modelsSettings{
 					Model:              models.Model{ID: 555111},
 					OrganizationMember: models.OrganizationMember{OrganizationID: org.ID},
 				}
@@ -552,12 +562,17 @@ INSERT INTO providers(id, name) VALUES (12345, 'okta');
 				}
 				assert.DeepEqual(t, p, expectedProvider)
 
+				type modelsSettings struct {
+					models.Model
+					models.OrganizationMember
+				}
+
 				stmt = `SELECT id, organization_id FROM settings;`
-				s := &models.Settings{}
+				s := &modelsSettings{}
 				err = tx.QueryRow(stmt).Scan(&s.ID, &s.OrganizationID)
 				assert.NilError(t, err)
 
-				expectedSettings := &models.Settings{
+				expectedSettings := &modelsSettings{
 					Model:              models.Model{ID: 555111},
 					OrganizationMember: models.OrganizationMember{OrganizationID: org.ID},
 				}
@@ -953,7 +968,7 @@ INSERT INTO providers(id, name) VALUES (12345, 'okta');
 						ID: 3,
 					},
 					Name:           "google-access",
-					IssuedFor:      user.ID,
+					IssuedForID:    user.ID,
 					ProviderID:     0, // old google ID
 					ExpiresAt:      time.Now().Add(1 * time.Minute),
 					KeyID:          "key_id",
@@ -966,7 +981,7 @@ INSERT INTO providers(id, name) VALUES (12345, 'okta');
 					INSERT INTO access_keys(id, name, issued_for, provider_id, expires_at, key_id, secret_checksum, organization_id)
 					VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 				`
-				_, err = tx.Exec(stmt, key.ID, key.Name, key.IssuedFor, key.ProviderID, key.ExpiresAt, key.KeyID, key.SecretChecksum, key.OrganizationID)
+				_, err = tx.Exec(stmt, key.ID, key.Name, key.IssuedForID, key.ProviderID, key.ExpiresAt, key.KeyID, key.SecretChecksum, key.OrganizationID)
 				assert.NilError(t, err)
 			},
 			cleanup: func(t *testing.T, tx WriteTxn) {
@@ -988,13 +1003,239 @@ INSERT INTO providers(id, name) VALUES (12345, 'okta');
 				assert.DeepEqual(t, expectedUser, providerUser)
 
 				var accessKey accessKeyTable
-				err = tx.QueryRow(`SELECT issued_for, provider_id FROM access_keys`).Scan(&accessKey.IssuedFor, &accessKey.ProviderID)
+				err = tx.QueryRow(`SELECT issued_for, provider_id FROM access_keys`).Scan(&accessKey.IssuedForID, &accessKey.ProviderID)
 				assert.NilError(t, err)
 				expectedKey := accessKeyTable{
-					IssuedFor:  1,
-					ProviderID: models.InternalGoogleProviderID,
+					IssuedForID: 1,
+					ProviderID:  models.InternalGoogleProviderID,
 				}
 				assert.DeepEqual(t, expectedKey, accessKey)
+			},
+		},
+		{
+			label: testCaseLine("2023-01-05T17:33"),
+			expected: func(t *testing.T, tx WriteTxn) {
+				// schema changes are tested with schema comparison
+			},
+		},
+		{
+			label: testCaseLine("2023-01-12T17:00"),
+			setup: func(t *testing.T, tx WriteTxn) {
+				query := querybuilder.New(`INSERT INTO grants`)
+				query.B(`(id, subject, resource, organization_id)`)
+				query.B(`VALUES`)
+				query.B(`(10001, 'i:TJMax', 'res1', 900),`)
+				query.B(`(10002, 'g:BeLL', 'res2', 901),`)
+				query.B(`(10003, 'i:DeLL', 'res3', 902)`)
+
+				_, err := tx.Exec(query.String(), query.Args...)
+				assert.NilError(t, err)
+			},
+			cleanup: func(t *testing.T, tx WriteTxn) {
+				_, err := tx.Exec(`DELETE FROM grants`)
+				assert.NilError(t, err)
+			},
+			expected: func(t *testing.T, tx WriteTxn) {
+				type grant struct {
+					ID             uid.ID
+					SubjectID      uid.ID
+					SubjectKind    models.SubjectKind
+					Resource       string
+					OrganizationID uid.ID
+				}
+
+				rows, err := tx.Query(`
+					SELECT id, subject_id, subject_kind, resource, organization_id
+					FROM grants`)
+				assert.NilError(t, err)
+
+				actual, err := scanRows(rows, func(g *grant) []any {
+					return []any{&g.ID, &g.SubjectID, &g.SubjectKind, &g.Resource, &g.OrganizationID}
+				})
+				assert.NilError(t, err)
+
+				expected := []grant{
+					{10001, 585487933, models.SubjectKindUser, "res1", 900},
+					{10002, 6875248, models.SubjectKindGroup, "res2", 901},
+					{10003, 7265472, models.SubjectKindUser, "res3", 902},
+				}
+				assert.DeepEqual(t, actual, expected)
+			},
+		},
+		{
+			label: testCaseLine("2023-01-17T11:36"),
+			expected: func(t *testing.T, tx WriteTxn) {
+				// schema changes are tested with schema comparison
+			},
+		},
+		{
+			label: testCaseLine("2023-01-18T10:26"),
+			setup: func(t *testing.T, tx WriteTxn) {
+				_, err := tx.Exec(`
+					INSERT INTO
+						organizations(id, created_at, updated_at, deleted_at, name, created_by, domain, allowed_domains)
+					VALUES
+						(1001, '2023-01-18 11:29:42.875+00', '2023-01-18 11:29:42.875+00', null, '202301181129', 1, '202301181129.example.com', ''),
+						(2001, '2023-01-18 11:30:42.875+00', '2023-01-18 11:30:42.875+00', null, '202301181130', 1, '202301181130.example.com', '')`)
+				assert.NilError(t, err)
+
+				_, err = tx.Exec(`
+					INSERT INTO
+						settings(id, created_at, updated_at, deleted_at, private_jwk, public_jwk, organization_id)
+					VALUES
+						(1002, '2023-01-18 11:29:42.875+00', '2023-01-18 11:29:42.875+00', null, ?, ?, 1001),
+						(2002, '2023-01-18 11:30:42.875+00', '2023-01-18 11:30:42.875+00', null, ?, ?, 2001)`,
+					models.EncryptedAtRest("superman"), []byte("clark-kent"),
+					models.EncryptedAtRest("batman"), []byte("bruce-wayne"))
+				assert.NilError(t, err)
+			},
+			cleanup: func(t *testing.T, tx WriteTxn) {
+				_, err := tx.Exec(`DELETE FROM organizations WHERE id IN (1001, 2001)`)
+				assert.NilError(t, err)
+				_, err = tx.Exec(`DELETE FROM settings WHERE id IN (1002, 2002)`)
+				assert.ErrorContains(t, err, "relation \"settings\" does not exist")
+			},
+			expected: func(t *testing.T, tx WriteTxn) {
+				rows, err := tx.Query(`SELECT id, name, domain, private_jwk, public_jwk, install_id FROM organizations WHERE id IN (1001, 2001)`)
+				assert.NilError(t, err)
+				defer rows.Close()
+
+				actual, err := scanRows(rows, func(o *models.Organization) []any {
+					return []any{&o.ID, &o.Name, &o.Domain, &o.PrivateJWK, &o.PublicJWK, &o.InstallID}
+				})
+				assert.NilError(t, err)
+
+				expected := []models.Organization{
+					{
+						Model: models.Model{
+							ID: 1001,
+						},
+						Name:       "202301181129",
+						Domain:     "202301181129.example.com",
+						PrivateJWK: models.EncryptedAtRest("superman"),
+						PublicJWK:  []byte("clark-kent"),
+						InstallID:  1002,
+					},
+					{
+						Model: models.Model{
+							ID: 2001,
+						},
+						Name:       "202301181130",
+						Domain:     "202301181130.example.com",
+						PrivateJWK: models.EncryptedAtRest("batman"),
+						PublicJWK:  []byte("bruce-wayne"),
+						InstallID:  2002,
+					},
+				}
+
+				assert.DeepEqual(t, actual, expected)
+			},
+		},
+		{
+			label: testCaseLine(addAccessKeyIssuedForKind().ID),
+			setup: func(t *testing.T, tx WriteTxn) {
+				stmt := `
+					INSERT INTO identities(id, name, organization_id) VALUES (1, 'test@example.com', 100);
+					INSERT INTO identities(id, name, organization_id) VALUES (2, 'connector', 100);
+				`
+
+				_, err := tx.Exec(stmt)
+				assert.NilError(t, err)
+				stmt = `
+					INSERT INTO providers(id, name, organization_id) VALUES (3, 'okta', 100);
+				`
+				_, err = tx.Exec(stmt)
+				assert.NilError(t, err)
+				stmt = `
+					INSERT INTO access_keys(id, name, issued_for, provider_id, organization_id) VALUES (4, 'userKey', 1, 3, 100);
+					INSERT INTO access_keys(id, name, issued_for, provider_id, organization_id) VALUES (5, 'connectorKey', 2, 3, 100);
+					INSERT INTO access_keys(id, name, issued_for, provider_id, organization_id) VALUES (6, 'providerKey', 3, 3, 100);
+				`
+				_, err = tx.Exec(stmt)
+				assert.NilError(t, err)
+			},
+			cleanup: func(t *testing.T, tx WriteTxn) {
+				_, err := tx.Exec(`DELETE from identities`)
+				assert.NilError(t, err)
+				_, err = tx.Exec(`DELETE from providers`)
+				assert.NilError(t, err)
+				_, err = tx.Exec(`DELETE from access_keys`)
+				assert.NilError(t, err)
+			},
+			expected: func(t *testing.T, tx WriteTxn) {
+				var accessKey accessKeyTable
+				err := tx.QueryRow(`SELECT name, issued_for_id, issued_for_kind FROM access_keys WHERE id = 4`).Scan(&accessKey.Name, &accessKey.IssuedForID, &accessKey.IssuedForKind)
+				assert.NilError(t, err)
+				expectedKey := accessKeyTable{
+					Name:          "userKey",
+					IssuedForID:   1,
+					IssuedForKind: models.IssuedForKindUser,
+				}
+				assert.DeepEqual(t, expectedKey, accessKey)
+
+				err = tx.QueryRow(`SELECT name, issued_for_id, issued_for_kind FROM access_keys WHERE id = 5`).Scan(&accessKey.Name, &accessKey.IssuedForID, &accessKey.IssuedForKind)
+				assert.NilError(t, err)
+				expectedKey = accessKeyTable{
+					Name:          "connectorKey",
+					IssuedForID:   2,
+					IssuedForKind: models.IssuedForKindOrganization,
+				}
+				assert.DeepEqual(t, expectedKey, accessKey)
+
+				err = tx.QueryRow(`SELECT name, issued_for_id, issued_for_kind FROM access_keys WHERE id = 6`).Scan(&accessKey.Name, &accessKey.IssuedForID, &accessKey.IssuedForKind)
+				assert.NilError(t, err)
+				expectedKey = accessKeyTable{
+					Name:          "providerKey",
+					IssuedForID:   3,
+					IssuedForKind: models.IssuedForKindProvider,
+				}
+				assert.DeepEqual(t, expectedKey, accessKey)
+			},
+		},
+		{
+			label: testCaseLine(storeProviderUserGroupsArray().ID),
+			setup: func(t *testing.T, db WriteTxn) {
+				stmt := `
+					INSERT INTO provider_users (identity_id, provider_id, email, groups) VALUES(1, 4,'test1@example.com', 'Everyone,Developers');
+					INSERT INTO provider_users (identity_id, provider_id, email, groups) VALUES(2, 5,'test2@example.com', 'Everyone');
+					INSERT INTO provider_users (identity_id, provider_id, email, groups) VALUES(3, 6,'test3@example.com', '');
+				`
+				_, err := db.Exec(stmt)
+				assert.NilError(t, err)
+			},
+			cleanup: func(t *testing.T, db WriteTxn) {
+				_, err := db.Exec(`DELETE FROM provider_users;`)
+				assert.NilError(t, err)
+			},
+			expected: func(t *testing.T, tx WriteTxn) {
+				var providerUser providerUserTable
+				err := tx.QueryRow(`SELECT identity_id, provider_id, email, groups FROM provider_users WHERE identity_id = 1`).Scan(&providerUser.IdentityID, &providerUser.ProviderID, &providerUser.Email, &providerUser.Groups)
+				assert.NilError(t, err)
+				expectedKey := providerUserTable{
+					IdentityID: 1,
+					ProviderID: 4,
+					Email:      "test1@example.com",
+					Groups:     []string{"Everyone", "Developers"},
+				}
+				assert.DeepEqual(t, expectedKey, providerUser)
+				err = tx.QueryRow(`SELECT identity_id, provider_id, email, groups FROM provider_users WHERE identity_id = 2`).Scan(&providerUser.IdentityID, &providerUser.ProviderID, &providerUser.Email, &providerUser.Groups)
+				assert.NilError(t, err)
+				expectedKey = providerUserTable{
+					IdentityID: 2,
+					ProviderID: 5,
+					Email:      "test2@example.com",
+					Groups:     []string{"Everyone"},
+				}
+				assert.DeepEqual(t, expectedKey, providerUser)
+				err = tx.QueryRow(`SELECT identity_id, provider_id, email, groups FROM provider_users WHERE identity_id = 3`).Scan(&providerUser.IdentityID, &providerUser.ProviderID, &providerUser.Email, &providerUser.Groups)
+				assert.NilError(t, err)
+				expectedKey = providerUserTable{
+					IdentityID: 3,
+					ProviderID: 6,
+					Email:      "test3@example.com",
+					Groups:     []string{},
+				}
+				assert.DeepEqual(t, expectedKey, providerUser)
 			},
 		},
 	}
@@ -1071,8 +1312,6 @@ in ./migrations.go, add a test case to this test, and run the tests again.
 	runStep(t, "check test case cleanup", func(t *testing.T) {
 		// delete the default org, that we expect to exist.
 		_, err := db.Exec(` DELETE FROM organizations where id = ?`, defaultOrganizationID)
-		assert.NilError(t, err)
-		_, err = db.Exec(`DELETE FROM settings where organization_id = ?`, defaultOrganizationID)
 		assert.NilError(t, err)
 
 		data := dumpSchema(t, os.Getenv("POSTGRESQL_CONNECTION"),

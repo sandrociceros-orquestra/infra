@@ -31,10 +31,13 @@
             "format": "date-time",
             "type": "string"
           },
-          "issuedFor": {
+          "issuedForID": {
             "example": "4yJ3n3D8E2",
             "format": "uid",
             "pattern": "[1-9a-km-zA-HJ-NP-Z]{1,11}",
+            "type": "string"
+          },
+          "issuedForKind": {
             "type": "string"
           },
           "name": {
@@ -420,98 +423,6 @@
           }
         }
       },
-      "ListGrantsResponse": {
-        "properties": {
-          "count": {
-            "description": "Total number of items on the current page",
-            "example": "100",
-            "format": "int",
-            "type": "integer"
-          },
-          "items": {
-            "items": {
-              "properties": {
-                "created": {
-                  "description": "formatted as an RFC3339 date-time",
-                  "example": "2022-03-14T09:48:00Z",
-                  "format": "date-time",
-                  "type": "string"
-                },
-                "createdBy": {
-                  "description": "id of the user that created the grant",
-                  "example": "4yJ3n3D8E2",
-                  "format": "uid",
-                  "pattern": "[1-9a-km-zA-HJ-NP-Z]{1,11}",
-                  "type": "string"
-                },
-                "group": {
-                  "description": "GroupID for a group being granted access",
-                  "example": "3zMaadcd2U",
-                  "format": "uid",
-                  "pattern": "[1-9a-km-zA-HJ-NP-Z]{1,11}",
-                  "type": "string"
-                },
-                "id": {
-                  "description": "ID of grant created",
-                  "example": "3w9XyTrkzk",
-                  "format": "uid",
-                  "pattern": "[1-9a-km-zA-HJ-NP-Z]{1,11}",
-                  "type": "string"
-                },
-                "privilege": {
-                  "description": "a role or permission",
-                  "example": "admin",
-                  "type": "string"
-                },
-                "resource": {
-                  "description": "a resource name in Infra's Universal Resource Notation",
-                  "example": "production.namespace",
-                  "type": "string"
-                },
-                "updated": {
-                  "description": "formatted as an RFC3339 date-time",
-                  "example": "2022-03-14T09:48:00Z",
-                  "format": "date-time",
-                  "type": "string"
-                },
-                "user": {
-                  "description": "UserID for a user being granted access",
-                  "example": "6hNnjfjVcc",
-                  "format": "uid",
-                  "pattern": "[1-9a-km-zA-HJ-NP-Z]{1,11}",
-                  "type": "string"
-                }
-              },
-              "type": "object"
-            },
-            "type": "array"
-          },
-          "limit": {
-            "description": "Number of objects per page",
-            "example": "100",
-            "format": "int",
-            "type": "integer"
-          },
-          "page": {
-            "description": "Page number retrieved",
-            "example": "1",
-            "format": "int",
-            "type": "integer"
-          },
-          "totalCount": {
-            "description": "Total number of objects",
-            "example": "485",
-            "format": "int",
-            "type": "integer"
-          },
-          "totalPages": {
-            "description": "Total number of pages",
-            "example": "5",
-            "format": "int",
-            "type": "integer"
-          }
-        }
-      },
       "ListResponse_AccessKey": {
         "properties": {
           "count": {
@@ -548,11 +459,16 @@
                   "format": "date-time",
                   "type": "string"
                 },
-                "issuedFor": {
-                  "description": "ID of the user the key was issued to",
+                "issuedForID": {
+                  "description": "ID of the entity the key was issued to",
                   "example": "4yJ3n3D8E2",
                   "format": "uid",
                   "pattern": "[1-9a-km-zA-HJ-NP-Z]{1,11}",
+                  "type": "string"
+                },
+                "issuedForKind": {
+                  "description": "the kind entity the key was issued for (eg: user, organization, or provider)",
+                  "example": "user",
                   "type": "string"
                 },
                 "issuedForName": {
@@ -712,6 +628,98 @@
                 },
                 "version": {
                   "description": "Application version of the connector for this destination",
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "limit": {
+            "description": "Number of objects per page",
+            "example": "100",
+            "format": "int",
+            "type": "integer"
+          },
+          "page": {
+            "description": "Page number retrieved",
+            "example": "1",
+            "format": "int",
+            "type": "integer"
+          },
+          "totalCount": {
+            "description": "Total number of objects",
+            "example": "485",
+            "format": "int",
+            "type": "integer"
+          },
+          "totalPages": {
+            "description": "Total number of pages",
+            "example": "5",
+            "format": "int",
+            "type": "integer"
+          }
+        }
+      },
+      "ListResponse_Grant": {
+        "properties": {
+          "count": {
+            "description": "Total number of items on the current page",
+            "example": "100",
+            "format": "int",
+            "type": "integer"
+          },
+          "items": {
+            "items": {
+              "properties": {
+                "created": {
+                  "description": "formatted as an RFC3339 date-time",
+                  "example": "2022-03-14T09:48:00Z",
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "createdBy": {
+                  "description": "id of the user that created the grant",
+                  "example": "4yJ3n3D8E2",
+                  "format": "uid",
+                  "pattern": "[1-9a-km-zA-HJ-NP-Z]{1,11}",
+                  "type": "string"
+                },
+                "group": {
+                  "description": "GroupID for a group being granted access",
+                  "example": "3zMaadcd2U",
+                  "format": "uid",
+                  "pattern": "[1-9a-km-zA-HJ-NP-Z]{1,11}",
+                  "type": "string"
+                },
+                "id": {
+                  "description": "ID of grant created",
+                  "example": "3w9XyTrkzk",
+                  "format": "uid",
+                  "pattern": "[1-9a-km-zA-HJ-NP-Z]{1,11}",
+                  "type": "string"
+                },
+                "privilege": {
+                  "description": "a role or permission",
+                  "example": "admin",
+                  "type": "string"
+                },
+                "resource": {
+                  "description": "a resource name in Infra's Universal Resource Notation",
+                  "example": "production.namespace",
+                  "type": "string"
+                },
+                "updated": {
+                  "description": "formatted as an RFC3339 date-time",
+                  "example": "2022-03-14T09:48:00Z",
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "user": {
+                  "description": "UserID for a user being granted access",
+                  "example": "6hNnjfjVcc",
+                  "format": "uid",
+                  "pattern": "[1-9a-km-zA-HJ-NP-Z]{1,11}",
                   "type": "string"
                 }
               },
@@ -1045,6 +1053,12 @@
                         "format": "date-time",
                         "type": "string"
                       },
+                      "expires": {
+                        "description": "formatted as an RFC3339 date-time",
+                        "example": "2022-03-14T09:48:00Z",
+                        "format": "date-time",
+                        "type": "string"
+                      },
                       "fingerprint": {
                         "description": "SHA256 fingerprint of the key",
                         "type": "string"
@@ -1310,38 +1324,96 @@
           }
         }
       },
-      "Settings": {
+      "UpdateUserResponse": {
         "properties": {
-          "passwordRequirements": {
-            "properties": {
-              "lengthMin": {
-                "description": "Minimum password length. Must be at least 8 characters.",
-                "format": "int",
-                "minimum": 8,
-                "type": "integer"
-              },
-              "lowercaseMin": {
-                "description": "Minimum number of lowercase ASCII letters.",
-                "format": "int",
-                "type": "integer"
-              },
-              "numberMin": {
-                "description": "Minimum number of numbers.",
-                "format": "int",
-                "type": "integer"
-              },
-              "symbolMin": {
-                "description": "Minimum number of symbols.",
-                "format": "int",
-                "type": "integer"
-              },
-              "uppercaseMin": {
-                "description": "Minimum number of uppercase ASCII letters.",
-                "format": "int",
-                "type": "integer"
-              }
+          "created": {
+            "description": "Date the user was created",
+            "example": "2022-03-14T09:48:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "User ID",
+            "example": "4ACFkc434M",
+            "format": "uid",
+            "pattern": "[1-9a-km-zA-HJ-NP-Z]{1,11}",
+            "type": "string"
+          },
+          "lastSeenAt": {
+            "description": "Date the user was last seen",
+            "example": "2022-03-14T09:48:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "name": {
+            "description": "Name of the user",
+            "example": "bob@example.com",
+            "type": "string"
+          },
+          "oneTimePassword": {
+            "type": "string"
+          },
+          "providerNames": {
+            "description": "List of providers this user belongs to",
+            "example": "['okta']",
+            "items": {
+              "description": "List of providers this user belongs to",
+              "example": "['okta']",
+              "type": "string"
             },
-            "type": "object"
+            "type": "array"
+          },
+          "publicKeys": {
+            "description": "List of the users public keys",
+            "items": {
+              "description": "List of the users public keys",
+              "properties": {
+                "created": {
+                  "description": "formatted as an RFC3339 date-time",
+                  "example": "2022-03-14T09:48:00Z",
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "expires": {
+                  "description": "formatted as an RFC3339 date-time",
+                  "example": "2022-03-14T09:48:00Z",
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "fingerprint": {
+                  "description": "SHA256 fingerprint of the key",
+                  "type": "string"
+                },
+                "id": {
+                  "example": "4yJ3n3D8E2",
+                  "format": "uid",
+                  "pattern": "[1-9a-km-zA-HJ-NP-Z]{1,11}",
+                  "type": "string"
+                },
+                "keyType": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "publicKey": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "sshLoginName": {
+            "description": "Username for SSH destinations",
+            "example": "bob",
+            "type": "string"
+          },
+          "updated": {
+            "description": "Date the user was updated",
+            "example": "2022-03-14T09:48:00Z",
+            "format": "date-time",
+            "type": "string"
           }
         }
       },
@@ -1392,6 +1464,12 @@
                   "format": "date-time",
                   "type": "string"
                 },
+                "expires": {
+                  "description": "formatted as an RFC3339 date-time",
+                  "example": "2022-03-14T09:48:00Z",
+                  "format": "date-time",
+                  "type": "string"
+                },
                 "fingerprint": {
                   "description": "SHA256 fingerprint of the key",
                   "type": "string"
@@ -1432,6 +1510,12 @@
       "UserPublicKey": {
         "properties": {
           "created": {
+            "description": "formatted as an RFC3339 date-time",
+            "example": "2022-03-14T09:48:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "expires": {
             "description": "formatted as an RFC3339 date-time",
             "example": "2022-03-14T09:48:00Z",
             "format": "date-time",
@@ -1785,21 +1869,30 @@
                     "format": "duration",
                     "type": "string"
                   },
+                  "issuedForID": {
+                    "example": "4yJ3n3D8E2",
+                    "format": "uid",
+                    "pattern": "[1-9a-km-zA-HJ-NP-Z]{1,11}",
+                    "type": "string"
+                  },
+                  "issuedForKind": {
+                    "enum": [
+                      "user",
+                      "provider",
+                      "organization"
+                    ],
+                    "type": "string"
+                  },
                   "name": {
                     "format": "[a-zA-Z0-9\\-_.]",
                     "maxLength": 256,
                     "minLength": 2,
                     "type": "string"
-                  },
-                  "userID": {
-                    "example": "4yJ3n3D8E2",
-                    "format": "uid",
-                    "pattern": "[1-9a-km-zA-HJ-NP-Z]{1,11}",
-                    "type": "string"
                   }
                 },
                 "required": [
-                  "userID",
+                  "issuedForID",
+                  "issuedForKind",
                   "expiry",
                   "inactivityTimeout"
                 ],
@@ -3291,7 +3384,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ListGrantsResponse"
+                  "$ref": "#/components/schemas/ListResponse_Grant"
                 }
               }
             },
@@ -5247,6 +5340,131 @@
         "tags": [
           "Organizations"
         ]
+      },
+      "put": {
+        "description": "UpdateOrganization",
+        "operationId": "UpdateOrganization",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Infra-Version",
+            "required": true,
+            "schema": {
+              "description": "Version of the API being requested",
+              "example": "0.0.0",
+              "format": "\\d+\\.\\d+\\(.\\d+)?(-.\\w(+\\w)?)?",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": true,
+            "schema": {
+              "description": "Bearer followed by your access key",
+              "example": "Bearer ACCESSKEY",
+              "format": "Bearer [\\da-zA-Z]{10}\\.[\\da-zA-Z]{24}",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "example": "4yJ3n3D8E2",
+              "format": "uid",
+              "pattern": "[1-9a-km-zA-HJ-NP-Z]{1,11}",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "allowedDomains": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "allowedDomains"
+                ],
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Unauthorized: Requestor is not authenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Forbidden: Requestor does not have the right permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Duplicate Record"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Organization"
+                }
+              }
+            },
+            "description": "Success"
+          }
+        },
+        "summary": "UpdateOrganization",
+        "tags": [
+          "Organizations"
+        ]
       }
     },
     "/api/password-reset": {
@@ -6318,227 +6536,6 @@
         ]
       }
     },
-    "/api/settings": {
-      "get": {
-        "description": "GetSettings",
-        "operationId": "GetSettings",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "Infra-Version",
-            "required": true,
-            "schema": {
-              "description": "Version of the API being requested",
-              "example": "0.0.0",
-              "format": "\\d+\\.\\d+\\(.\\d+)?(-.\\w(+\\w)?)?",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Bad Request"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Unauthorized: Requestor is not authenticated"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Forbidden: Requestor does not have the right permissions"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Not Found"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Duplicate Record"
-          },
-          "default": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Settings"
-                }
-              }
-            },
-            "description": "Success"
-          }
-        },
-        "summary": "GetSettings",
-        "tags": [
-          "Settings"
-        ]
-      },
-      "put": {
-        "description": "UpdateSettings",
-        "operationId": "UpdateSettings",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "Infra-Version",
-            "required": true,
-            "schema": {
-              "description": "Version of the API being requested",
-              "example": "0.0.0",
-              "format": "\\d+\\.\\d+\\(.\\d+)?(-.\\w(+\\w)?)?",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
-            "name": "Authorization",
-            "required": true,
-            "schema": {
-              "description": "Bearer followed by your access key",
-              "example": "Bearer ACCESSKEY",
-              "format": "Bearer [\\da-zA-Z]{10}\\.[\\da-zA-Z]{24}",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "properties": {
-                  "passwordRequirements": {
-                    "properties": {
-                      "lengthMin": {
-                        "description": "Minimum password length. Must be at least 8 characters.",
-                        "format": "int",
-                        "minimum": 8,
-                        "type": "integer"
-                      },
-                      "lowercaseMin": {
-                        "description": "Minimum number of lowercase ASCII letters.",
-                        "format": "int",
-                        "type": "integer"
-                      },
-                      "numberMin": {
-                        "description": "Minimum number of numbers.",
-                        "format": "int",
-                        "type": "integer"
-                      },
-                      "symbolMin": {
-                        "description": "Minimum number of symbols.",
-                        "format": "int",
-                        "type": "integer"
-                      },
-                      "uppercaseMin": {
-                        "description": "Minimum number of uppercase ASCII letters.",
-                        "format": "int",
-                        "type": "integer"
-                      }
-                    },
-                    "type": "object"
-                  }
-                },
-                "type": "object"
-              }
-            }
-          }
-        },
-        "responses": {
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Bad Request"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Unauthorized: Requestor is not authenticated"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Forbidden: Requestor does not have the right permissions"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Not Found"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Duplicate Record"
-          },
-          "default": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Settings"
-                }
-              }
-            },
-            "description": "Success"
-          }
-        },
-        "summary": "UpdateSettings",
-        "tags": [
-          "Settings"
-        ]
-      }
-    },
     "/api/tokens": {
       "post": {
         "description": "CreateToken",
@@ -7318,9 +7315,6 @@
                     "type": "string"
                   }
                 },
-                "required": [
-                  "password"
-                ],
                 "type": "object"
               }
             }
@@ -7381,7 +7375,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/User"
+                  "$ref": "#/components/schemas/UpdateUserResponse"
                 }
               }
             },

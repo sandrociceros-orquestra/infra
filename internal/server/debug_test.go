@@ -29,7 +29,7 @@ func TestAPI_PProfHandler(t *testing.T) {
 	run := func(t *testing.T, tc testCase) {
 		// nolint:noctx
 		req := httptest.NewRequest(http.MethodGet, "/api/debug/pprof/heap?debug=1", nil)
-		req.Header.Add("Infra-Version", "0.12.3")
+		req.Header.Add("Infra-Version", apiVersionLatest)
 
 		if tc.setupRequest != nil {
 			tc.setupRequest(t, req)
@@ -65,7 +65,7 @@ func TestAPI_PProfHandler(t *testing.T) {
 			setupRequest: func(t *testing.T, req *http.Request) {
 				key, user := createAccessKey(t, s.DB(), "user2@example.com")
 				err := data.CreateGrant(s.DB(), &models.Grant{
-					Subject:   user.PolyID(),
+					Subject:   models.NewSubjectForUser(user.ID),
 					Privilege: models.InfraSupportAdminRole,
 					Resource:  access.ResourceInfraAPI,
 					CreatedBy: user.ID,

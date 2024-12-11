@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/crypto/bcrypt"
@@ -240,6 +241,7 @@ func TestGetIdentity(t *testing.T) {
 			PublicKey:   "the-key",
 			KeyType:     "ssh-rsa",
 			Fingerprint: "the-fingerprint",
+			ExpiresAt:   time.Now().Add(time.Hour).Truncate(time.Millisecond),
 		}
 		err = AddUserPublicKey(db, bondKey)
 		assert.NilError(t, err)
@@ -286,9 +288,17 @@ func TestGetIdentity(t *testing.T) {
 					PublicKey:   "the-key",
 					KeyType:     "ssh-rsa",
 					Fingerprint: "the-fingerprint",
+					ExpiresAt:   bondKey.ExpiresAt,
 				},
 			}
 			assert.DeepEqual(t, *identity, expected, cmpTimeWithDBPrecision)
+		})
+		t.Run("from other organization", func(t *testing.T) {
+			_, err := GetIdentity(db, GetIdentityOptions{
+				ByID:             bond.ID,
+				FromOrganization: 71234,
+			})
+			assert.ErrorIs(t, err, internal.ErrNotFound)
 		})
 	})
 }
@@ -369,25 +379,6 @@ func TestListIdentities(t *testing.T) {
 			assert.DeepEqual(t, actual, expected, cmpModelsIdentityShallow)
 		})
 
-		t.Run("filter identities by created by", func(t *testing.T) {
-			actual, err := ListIdentities(db, ListIdentityOptions{CreatedBy: uid.ID(1000)})
-			assert.NilError(t, err)
-			expected := []models.Identity{salt}
-			assert.DeepEqual(t, actual, expected, cmpModelsIdentityShallow)
-		})
-
-		t.Run("filter by not IDs requires created by", func(t *testing.T) {
-			_, err := ListIdentities(db, ListIdentityOptions{ByNotIDs: []uid.ID{bourne.ID, bauer.ID}})
-			assert.ErrorContains(t, err, "ListIdentities by 'not IDs' requires 'created by'")
-		})
-
-		t.Run("filter by not IDs", func(t *testing.T) {
-			identities, err := ListIdentities(db, ListIdentityOptions{CreatedBy: uid.ID(1000), ByNotIDs: []uid.ID{bourne.ID, bauer.ID}})
-			assert.NilError(t, err)
-			expected := []models.Identity{salt}
-			assert.DeepEqual(t, identities, expected, cmpModelsIdentityShallow)
-		})
-
 		t.Run("filter identities by group and name", func(t *testing.T) {
 			actual, err := ListIdentities(db, ListIdentityOptions{ByGroupID: everyone.ID, ByName: bauer.Name})
 			assert.NilError(t, err)
@@ -414,6 +405,7 @@ func TestListIdentities(t *testing.T) {
 				Fingerprint: "the-fingerprint",
 				KeyType:     "ssh-rsa",
 				PublicKey:   "the-public-key",
+				ExpiresAt:   time.Now().Add(time.Hour).Truncate(time.Millisecond),
 			}
 			assert.NilError(t, AddUserPublicKey(db, pubKey))
 
@@ -490,15 +482,6 @@ func TestDeleteIdentities(t *testing.T) {
 	}
 	testCases := []testCase{
 		{
-			name: "provider ID is required",
-			setup: func(t *testing.T, tx *Transaction) (opts DeleteIdentitiesOptions, identity models.Identity) {
-				return DeleteIdentitiesOptions{}, models.Identity{}
-			},
-			verify: func(t *testing.T, tx *Transaction, err error, identity models.Identity) {
-				assert.ErrorContains(t, err, "DeleteIdentities requires a provider ID")
-			},
-		},
-		{
 			name: "valid delete infra provider user",
 			setup: func(t *testing.T, tx *Transaction) (opts DeleteIdentitiesOptions, identity models.Identity) {
 				var (
@@ -521,7 +504,7 @@ func TestDeleteIdentities(t *testing.T) {
 				err = AddUsersToGroup(tx, group.ID, []uid.ID{bond.ID})
 				assert.NilError(t, err)
 
-				err = CreateGrant(tx, &models.Grant{Subject: bond.PolyID(), Privilege: "admin", Resource: "infra"})
+				err = CreateGrant(tx, &models.Grant{Subject: models.NewSubjectForUser(bond.ID), Privilege: "admin", Resource: "infra"})
 				assert.NilError(t, err)
 
 				return DeleteIdentitiesOptions{
@@ -541,7 +524,7 @@ func TestDeleteIdentities(t *testing.T) {
 				groupIDs, err := ListGroupIDsForUser(tx, identity.ID)
 				assert.NilError(t, err)
 				assert.Equal(t, len(groupIDs), 0)
-				grants, err := ListGrants(tx, ListGrantsOptions{BySubject: identity.PolyID()})
+				grants, err := ListGrants(tx, ListGrantsOptions{BySubject: models.NewSubjectForUser(identity.ID)})
 				assert.NilError(t, err)
 				assert.Equal(t, len(grants), 0)
 
@@ -560,40 +543,6 @@ func TestDeleteIdentities(t *testing.T) {
 			},
 			verify: func(t *testing.T, tx *Transaction, err error, identity models.Identity) {
 				assert.NilError(t, err)
-			},
-		},
-		{
-			name: "delete identity in provider outside infra does not delete credentials",
-			setup: func(t *testing.T, tx *Transaction) (opts DeleteIdentitiesOptions, identity models.Identity) {
-				id := &models.Identity{Name: "jbond@infrahq.com"}
-				createIdentities(t, tx, id)
-
-				err := CreateCredential(tx, &models.Credential{IdentityID: id.ID, PasswordHash: []byte("abc")})
-				assert.NilError(t, err)
-
-				provider := &models.Provider{
-					Name: "other",
-					Kind: models.ProviderKindOIDC,
-				}
-				err = CreateProvider(tx, provider)
-				assert.NilError(t, err)
-
-				_, err = CreateProviderUser(tx, provider, id)
-				assert.NilError(t, err)
-
-				return DeleteIdentitiesOptions{
-					ByProviderID: provider.ID,
-					ByID:         id.ID,
-				}, *id
-			},
-			verify: func(t *testing.T, tx *Transaction, err error, identity models.Identity) {
-				assert.NilError(t, err)
-
-				id, err := GetIdentity(tx, GetIdentityOptions{ByName: identity.Name})
-				assert.NilError(t, err) // still exists in infra provider
-
-				_, err = GetCredentialByUserID(tx, id.ID)
-				assert.NilError(t, err) // still exists in infra provider
 			},
 		},
 		{
@@ -654,79 +603,6 @@ func TestDeleteIdentities(t *testing.T) {
 				_, err = GetIdentity(tx, GetIdentityOptions{ByID: 2})
 				assert.Error(t, err, "record not found")
 				_, err = GetIdentity(tx, GetIdentityOptions{ByID: 3})
-				assert.NilError(t, err) // still exists
-			},
-		},
-		{
-			name: "delete by not IDs requires created by",
-			setup: func(t *testing.T, tx *Transaction) (opts DeleteIdentitiesOptions, identity models.Identity) {
-				return DeleteIdentitiesOptions{
-					ByProviderID: InfraProvider(tx).ID,
-					ByNotIDs:     []uid.ID{1, 2},
-				}, models.Identity{} // not used
-			},
-			verify: func(t *testing.T, tx *Transaction, err error, identity models.Identity) {
-				assert.ErrorContains(t, err, "ListIdentities by 'not IDs' requires 'created by'")
-			},
-		},
-		{
-			name: "delete by not IDs",
-			setup: func(t *testing.T, tx *Transaction) (opts DeleteIdentitiesOptions, identity models.Identity) {
-				id1 := &models.Identity{
-					Model:     models.Model{ID: 1},
-					Name:      "name1@infrahq.com",
-					CreatedBy: 1000,
-				}
-				id2 := &models.Identity{
-					Model:     models.Model{ID: 2},
-					Name:      "name2@infrahq.com",
-					CreatedBy: 1000,
-				}
-				id3 := &models.Identity{
-					Model:     models.Model{ID: 3},
-					Name:      "name3@infrahq.com",
-					CreatedBy: 1000,
-				}
-				createIdentities(t, tx, id1, id2, id3)
-				return DeleteIdentitiesOptions{
-					ByProviderID: InfraProvider(tx).ID,
-					ByNotIDs:     []uid.ID{id1.ID, id2.ID},
-					CreatedBy:    1000,
-				}, models.Identity{} // not used
-			},
-			verify: func(t *testing.T, tx *Transaction, err error, identity models.Identity) {
-				assert.NilError(t, err)
-				_, err = GetIdentity(tx, GetIdentityOptions{ByID: 3})
-				assert.Error(t, err, "record not found")
-				_, err = GetIdentity(tx, GetIdentityOptions{ByID: 2})
-				assert.NilError(t, err) // still exists
-				_, err = GetIdentity(tx, GetIdentityOptions{ByID: 1})
-				assert.NilError(t, err) // still exists
-			},
-		},
-		{
-			name: "delete by created by",
-			setup: func(t *testing.T, tx *Transaction) (opts DeleteIdentitiesOptions, identity models.Identity) {
-				id1 := &models.Identity{
-					Model:     models.Model{ID: 1},
-					Name:      "name1@infrahq.com",
-					CreatedBy: 1,
-				}
-				id2 := &models.Identity{
-					Model: models.Model{ID: 2},
-					Name:  "name2@infrahq.com",
-				}
-				createIdentities(t, tx, id1, id2)
-				return DeleteIdentitiesOptions{
-					ByProviderID: InfraProvider(tx).ID,
-					CreatedBy:    uid.ID(1),
-				}, models.Identity{} // not used
-			},
-			verify: func(t *testing.T, tx *Transaction, err error, identity models.Identity) {
-				assert.NilError(t, err)
-				_, err = GetIdentity(tx, GetIdentityOptions{ByID: 1})
-				assert.Error(t, err, "record not found")
-				_, err = GetIdentity(tx, GetIdentityOptions{ByID: 2})
 				assert.NilError(t, err) // still exists
 			},
 		},
@@ -864,6 +740,54 @@ func TestAssignIdentityToGroups(t *testing.T) {
 				},
 			},
 		},
+		{
+			Name:           "test where user has groups from this provider removed",
+			StartingGroups: []string{"foo"},
+			ExistingGroups: []string{"foo"},
+			IncomingGroups: []string{"foo2"},
+			ExpectedGroups: []models.Group{
+				{
+					Name: "foo2",
+					OrganizationMember: models.OrganizationMember{
+						OrganizationID: 1000,
+					},
+				},
+			},
+		},
+		{
+			Name:           "test where the user has duplicate groups",
+			StartingGroups: []string{"foo"},
+			ExistingGroups: []string{"foo"},
+			IncomingGroups: []string{"foo2", "foo2"},
+			ExpectedGroups: []models.Group{
+				{
+					Name: "foo2",
+					OrganizationMember: models.OrganizationMember{
+						OrganizationID: 1000,
+					},
+				},
+			},
+		},
+		{
+			Name:           "test where the group has a comma in its name",
+			StartingGroups: []string{"foo"},
+			ExistingGroups: []string{},
+			IncomingGroups: []string{"foo", "foo,2"},
+			ExpectedGroups: []models.Group{
+				{
+					Name: "foo",
+					OrganizationMember: models.OrganizationMember{
+						OrganizationID: 1000,
+					},
+				},
+				{
+					Name: "foo,2",
+					OrganizationMember: models.OrganizationMember{
+						OrganizationID: 1000,
+					},
+				},
+			},
+		},
 	}
 
 	runDBTests(t, func(t *testing.T, db *DB) {
@@ -901,14 +825,18 @@ func TestAssignIdentityToGroups(t *testing.T) {
 				err = UpdateProviderUser(db, pu)
 				assert.NilError(t, err)
 
-				err = AssignIdentityToGroups(db, identity, provider, test.IncomingGroups)
+				_, err = AssignIdentityToGroups(db, pu, test.ExistingGroups)
 				assert.NilError(t, err)
 
-				// check the result
-				actual, err := ListGroups(db, ListGroupsOptions{ByGroupMember: identity.ID})
+				result, err := AssignIdentityToGroups(db, pu, test.IncomingGroups)
 				assert.NilError(t, err)
 
-				assert.DeepEqual(t, actual, test.ExpectedGroups, cmpModelsGroupShallow)
+				assert.DeepEqual(t, result, test.ExpectedGroups, cmpModelsGroupShallow)
+
+				// check the persisted result
+				persisted, err := ListGroups(db, ListGroupsOptions{ByGroupMember: identity.ID})
+				assert.NilError(t, err)
+				assert.DeepEqual(t, persisted, test.ExpectedGroups, cmpModelsGroupShallow)
 			})
 		}
 	})

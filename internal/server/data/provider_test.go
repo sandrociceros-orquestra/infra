@@ -142,6 +142,13 @@ func TestGetProvider(t *testing.T) {
 			_, err := GetProvider(db, GetProviderOptions{ByName: "does-not-exist"})
 			assert.ErrorIs(t, err, internal.ErrNotFound)
 		})
+		t.Run("from other organization", func(t *testing.T) {
+			_, err := GetProvider(db, GetProviderOptions{
+				ByName:           "okta-development",
+				FromOrganization: 71234,
+			})
+			assert.ErrorIs(t, err, internal.ErrNotFound)
+		})
 	})
 }
 
@@ -215,16 +222,6 @@ func TestListProviders(t *testing.T) {
 			assert.NilError(t, err)
 
 			expected := []models.Provider{*providerInfra, *providerDev}
-			assert.DeepEqual(t, expected, actual, cmpModelByID)
-		})
-		t.Run("created by and notIDs", func(t *testing.T) {
-			actual, err := ListProviders(db, ListProvidersOptions{
-				CreatedBy: 777,
-				NotIDs:    []uid.ID{providerDev.ID},
-			})
-			assert.NilError(t, err)
-
-			expected := []models.Provider{*providerProd}
 			assert.DeepEqual(t, expected, actual, cmpModelByID)
 		})
 		t.Run("pagination", func(t *testing.T) {
@@ -362,10 +359,10 @@ func TestDeleteProviders(t *testing.T) {
 			tx := setup(t)
 
 			key := &models.AccessKey{
-				Name:       "test key",
-				IssuedFor:  user.ID,
-				ProviderID: providerDevelop.ID,
-				ExpiresAt:  time.Now().Add(5 * time.Minute),
+				Name:        "test key",
+				IssuedForID: user.ID,
+				ProviderID:  providerDevelop.ID,
+				ExpiresAt:   time.Now().Add(5 * time.Minute),
 			}
 
 			_, err := CreateAccessKey(tx, key)
@@ -385,10 +382,10 @@ func TestDeleteProviders(t *testing.T) {
 			assert.NilError(t, err)
 
 			key := &models.AccessKey{
-				Name:       "test key",
-				IssuedFor:  user.ID,
-				ProviderID: providerProduction.ID,
-				ExpiresAt:  time.Now().Add(5 * time.Minute),
+				Name:        "test key",
+				IssuedForID: user.ID,
+				ProviderID:  providerProduction.ID,
+				ExpiresAt:   time.Now().Add(5 * time.Minute),
 			}
 
 			_, err = CreateAccessKey(tx, key)

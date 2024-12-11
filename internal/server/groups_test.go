@@ -44,9 +44,9 @@ func TestAPI_ListGroups(t *testing.T) {
 	createIdentities(t, srv.DB(), &idInGroup, &idOther)
 
 	token := &models.AccessKey{
-		IssuedFor:  idInGroup.ID,
-		ProviderID: data.InfraProvider(srv.DB()).ID,
-		ExpiresAt:  time.Now().Add(10 * time.Second),
+		IssuedForID: idInGroup.ID,
+		ProviderID:  data.InfraProvider(srv.DB()).ID,
+		ExpiresAt:   time.Now().Add(10 * time.Second),
 	}
 
 	accessKey, err := data.CreateAccessKey(srv.DB(), token)
@@ -61,7 +61,7 @@ func TestAPI_ListGroups(t *testing.T) {
 	run := func(t *testing.T, tc testCase) {
 		req := httptest.NewRequest(http.MethodGet, tc.urlPath, nil)
 		req.Header.Set("Authorization", "Bearer "+accessKey)
-		req.Header.Add("Infra-Version", "0.13.0")
+		req.Header.Add("Infra-Version", apiVersionLatest)
 
 		if tc.setup != nil {
 			tc.setup(t, req)
@@ -187,9 +187,9 @@ func TestAPI_CreateGroup(t *testing.T) {
 	createIdentities(t, srv.DB(), &meUser)
 
 	token := &models.AccessKey{
-		IssuedFor:  meUser.ID,
-		ProviderID: data.InfraProvider(srv.DB()).ID,
-		ExpiresAt:  time.Now().Add(10 * time.Second),
+		IssuedForID: meUser.ID,
+		ProviderID:  data.InfraProvider(srv.DB()).ID,
+		ExpiresAt:   time.Now().Add(10 * time.Second),
 	}
 
 	accessKey, err := data.CreateAccessKey(srv.DB(), token)
@@ -200,7 +200,7 @@ func TestAPI_CreateGroup(t *testing.T) {
 		// nolint:noctx
 		req := httptest.NewRequest(http.MethodPost, "/api/groups", body)
 		req.Header.Set("Authorization", "Bearer "+accessKey)
-		req.Header.Add("Infra-Version", "0.13.0")
+		req.Header.Add("Infra-Version", apiVersionLatest)
 
 		if tc.setup != nil {
 			tc.setup(t, req)
@@ -276,9 +276,9 @@ func TestAPI_DeleteGroup(t *testing.T) {
 	}
 
 	token := &models.AccessKey{
-		IssuedFor:  inGroup.ID,
-		ProviderID: data.InfraProvider(srv.DB()).ID,
-		ExpiresAt:  time.Now().Add(10 * time.Second),
+		IssuedForID: inGroup.ID,
+		ProviderID:  data.InfraProvider(srv.DB()).ID,
+		ExpiresAt:   time.Now().Add(10 * time.Second),
 	}
 
 	accessKey, err := data.CreateAccessKey(srv.DB(), token)
@@ -288,7 +288,7 @@ func TestAPI_DeleteGroup(t *testing.T) {
 		// nolint:noctx
 		req := httptest.NewRequest(http.MethodDelete, tc.urlPath, nil)
 		req.Header.Set("Authorization", "Bearer "+accessKey)
-		req.Header.Add("Infra-Version", "0.13.0")
+		req.Header.Add("Infra-Version", apiVersionLatest)
 
 		if tc.setup != nil {
 			tc.setup(t, req)
@@ -351,9 +351,9 @@ func TestAPI_UpdateUsersInGroup(t *testing.T) {
 	}
 
 	token := &models.AccessKey{
-		IssuedFor:  first.ID,
-		ProviderID: data.InfraProvider(srv.DB()).ID,
-		ExpiresAt:  time.Now().Add(10 * time.Second),
+		IssuedForID: first.ID,
+		ProviderID:  data.InfraProvider(srv.DB()).ID,
+		ExpiresAt:   time.Now().Add(10 * time.Second),
 	}
 
 	accessKey, err := data.CreateAccessKey(srv.DB(), token)
@@ -364,7 +364,7 @@ func TestAPI_UpdateUsersInGroup(t *testing.T) {
 		// nolint:noctx
 		req := httptest.NewRequest(http.MethodPatch, tc.urlPath, body)
 		req.Header.Set("Authorization", "Bearer "+accessKey)
-		req.Header.Add("Infra-Version", "0.13.0")
+		req.Header.Add("Infra-Version", apiVersionLatest)
 
 		if tc.setup != nil {
 			tc.setup(t, req)

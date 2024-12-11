@@ -4,9 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
 
-	"github.com/gin-gonic/gin"
 	"github.com/rs/zerolog"
 
 	"github.com/infrahq/infra/api"
@@ -17,27 +15,17 @@ import (
 	"github.com/infrahq/infra/uid"
 )
 
-type ListGrantsResponse api.ListResponse[api.Grant]
-
-func (r ListGrantsResponse) SetHeaders(h http.Header) {
-	if r.LastUpdateIndex.Index > 0 {
-		h.Set("Last-Update-Index", strconv.FormatInt(r.LastUpdateIndex.Index, 10))
-	}
-}
-
-func (a *API) ListGrants(c *gin.Context, r *api.ListGrantsRequest) (*ListGrantsResponse, error) {
-	rCtx := getRequestContext(c)
-
+func (a *API) ListGrants(rCtx access.RequestContext, r *api.ListGrantsRequest) (*api.ListResponse[api.Grant], error) {
 	rCtx.Response.AddLogFields(func(event *zerolog.Event) {
 		event.Int64("lastUpdateIndex", r.LastUpdateIndex)
 	})
 
-	var subject uid.PolymorphicID
+	var subject models.Subject
 	switch {
 	case r.User != 0:
-		subject = uid.NewIdentityPolymorphicID(r.User)
+		subject = models.NewSubjectForUser(r.User)
 	case r.Group != 0:
-		subject = uid.NewGroupPolymorphicID(r.Group)
+		subject = models.NewSubjectForGroup(r.Group)
 	}
 
 	var p data.Pagination
@@ -56,7 +44,7 @@ func (a *API) ListGrants(c *gin.Context, r *api.ListGrantsRequest) (*ListGrantsR
 		opts.Pagination = &p
 	}
 
-	grants, err := access.ListGrants(c, opts, r.LastUpdateIndex)
+	grants, err := access.ListGrants(rCtx, opts, r.LastUpdateIndex)
 	if err != nil {
 		return nil, err
 	}
@@ -70,11 +58,11 @@ func (a *API) ListGrants(c *gin.Context, r *api.ListGrantsRequest) (*ListGrantsR
 	})
 	result.LastUpdateIndex.Index = grants.MaxUpdateIndex
 
-	return (*ListGrantsResponse)(result), nil
+	return result, nil
 }
 
-func (a *API) GetGrant(c *gin.Context, r *api.Resource) (*api.Grant, error) {
-	grant, err := access.GetGrant(c, r.ID)
+func (a *API) GetGrant(rCtx access.RequestContext, r *api.Resource) (*api.Grant, error) {
+	grant, err := access.GetGrant(rCtx, r.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -82,13 +70,13 @@ func (a *API) GetGrant(c *gin.Context, r *api.Resource) (*api.Grant, error) {
 	return grant.ToAPI(), nil
 }
 
-func (a *API) CreateGrant(c *gin.Context, r *api.GrantRequest) (*api.CreateGrantResponse, error) {
-	grant, err := getGrantFromGrantRequest(c, *r)
+func (a *API) CreateGrant(rCtx access.RequestContext, r *api.GrantRequest) (*api.CreateGrantResponse, error) {
+	grant, err := getGrantFromGrantRequest(rCtx, *r)
 	if err != nil {
 		return nil, err
 	}
 
-	err = access.CreateGrant(c, grant)
+	err = access.CreateGrant(rCtx, grant)
 	var ucerr data.UniqueConstraintError
 
 	if errors.As(err, &ucerr) {
@@ -97,7 +85,7 @@ func (a *API) CreateGrant(c *gin.Context, r *api.GrantRequest) (*api.CreateGrant
 			BySubject:    grant.Subject,
 			ByPrivileges: []string{grant.Privilege},
 		}
-		grants, err := access.ListGrants(c, opts, 0)
+		grants, err := access.ListGrants(rCtx, opts, 0)
 
 		if err != nil {
 			return nil, err
@@ -118,8 +106,8 @@ func (a *API) CreateGrant(c *gin.Context, r *api.GrantRequest) (*api.CreateGrant
 
 }
 
-func (a *API) DeleteGrant(c *gin.Context, r *api.Resource) (*api.EmptyResponse, error) {
-	grant, err := access.GetGrant(c, r.ID)
+func (a *API) DeleteGrant(rCtx access.RequestContext, r *api.Resource) (*api.EmptyResponse, error) {
+	grant, err := access.GetGrant(rCtx, r.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -129,7 +117,7 @@ func (a *API) DeleteGrant(c *gin.Context, r *api.Resource) (*api.EmptyResponse, 
 			ByResource:   access.ResourceInfraAPI,
 			ByPrivileges: []string{models.InfraAdminRole},
 		}
-		infraAdminGrants, err := access.ListGrants(c, opts, 0)
+		infraAdminGrants, err := access.ListGrants(rCtx, opts, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -139,14 +127,14 @@ func (a *API) DeleteGrant(c *gin.Context, r *api.Resource) (*api.EmptyResponse, 
 		}
 	}
 
-	return nil, access.DeleteGrant(c, r.ID)
+	return nil, access.DeleteGrant(rCtx, r.ID)
 }
 
-func (a *API) UpdateGrants(c *gin.Context, r *api.UpdateGrantsRequest) (*api.EmptyResponse, error) {
-	iden := access.GetRequestContext(c).Authenticated.User
+func (a *API) UpdateGrants(rCtx access.RequestContext, r *api.UpdateGrantsRequest) (*api.EmptyResponse, error) {
+	iden := rCtx.Authenticated.User
 	var addGrants []*models.Grant
 	for _, g := range r.GrantsToAdd {
-		grant, err := getGrantFromGrantRequest(c, g)
+		grant, err := getGrantFromGrantRequest(rCtx, g)
 		if err != nil {
 			return nil, err
 		}
@@ -156,47 +144,47 @@ func (a *API) UpdateGrants(c *gin.Context, r *api.UpdateGrantsRequest) (*api.Emp
 
 	var rmGrants []*models.Grant
 	for _, g := range r.GrantsToRemove {
-		grant, err := getGrantFromGrantRequest(c, g)
+		grant, err := getGrantFromGrantRequest(rCtx, g)
 		if err != nil {
 			return nil, err
 		}
 		rmGrants = append(rmGrants, grant)
 	}
 
-	return nil, access.UpdateGrants(c, addGrants, rmGrants)
+	return nil, access.UpdateGrants(rCtx, addGrants, rmGrants)
 }
 
-func getGrantFromGrantRequest(c *gin.Context, r api.GrantRequest) (*models.Grant, error) {
-	var subject uid.PolymorphicID
+func getGrantFromGrantRequest(rCtx access.RequestContext, r api.GrantRequest) (*models.Grant, error) {
+	var subject models.Subject
 
 	switch {
 	case r.UserName != "":
 		// lookup user name
-		identity, err := access.GetIdentity(c, data.GetIdentityOptions{ByName: r.UserName})
+		identity, err := access.GetIdentity(rCtx, data.GetIdentityOptions{ByName: r.UserName})
 		if err != nil {
 			if errors.Is(err, internal.ErrNotFound) {
 				return nil, fmt.Errorf("%w: couldn't find userName '%s'", internal.ErrBadRequest, r.UserName)
 			}
 			return nil, err
 		}
-		subject = uid.NewIdentityPolymorphicID(identity.ID)
+		subject = models.NewSubjectForUser(identity.ID)
 	case r.GroupName != "":
-		group, err := access.GetGroup(c, data.GetGroupOptions{ByName: r.GroupName})
+		group, err := access.GetGroup(rCtx, data.GetGroupOptions{ByName: r.GroupName})
 		if err != nil {
 			if errors.Is(err, internal.ErrNotFound) {
 				return nil, fmt.Errorf("%w: couldn't find groupName '%s'", internal.ErrBadRequest, r.GroupName)
 			}
 			return nil, err
 		}
-		subject = uid.NewGroupPolymorphicID(group.ID)
+		subject = models.NewSubjectForGroup(group.ID)
 	case r.User != 0:
-		subject = uid.NewIdentityPolymorphicID(r.User)
+		subject = models.NewSubjectForUser(r.User)
 	case r.Group != 0:
-		subject = uid.NewGroupPolymorphicID(r.Group)
+		subject = models.NewSubjectForGroup(r.Group)
 	}
 
 	switch {
-	case subject == "":
+	case subject.ID == 0 || subject.Kind == 0:
 		return nil, fmt.Errorf("%w: must specify userName, user, or group", internal.ErrBadRequest)
 	case r.Resource == "":
 		return nil, fmt.Errorf("%w: must specify resource", internal.ErrBadRequest)
@@ -209,4 +197,72 @@ func getGrantFromGrantRequest(c *gin.Context, r api.GrantRequest) (*models.Grant
 		Resource:  r.Resource,
 		Privilege: r.Privilege,
 	}, nil
+}
+
+// See docs/dev/api-versioned-handlers.md for a guide to adding new version handlers.
+func (a *API) addPreviousVersionHandlersGrants() {
+	type grantV0_18_1 struct {
+		ID        uid.ID   `json:"id"`
+		Created   api.Time `json:"created"`
+		CreatedBy uid.ID   `json:"created_by"`
+		Updated   api.Time `json:"updated"`
+		User      uid.ID   `json:"user,omitempty"`
+		Group     uid.ID   `json:"group,omitempty"`
+		Privilege string   `json:"privilege"`
+		Resource  string   `json:"resource"`
+	}
+
+	newGrantsV0_18_1FromLatest := func(latest *api.Grant) *grantV0_18_1 {
+		if latest == nil {
+			return nil
+		}
+		return &grantV0_18_1{
+			ID:        latest.ID,
+			Created:   latest.Created,
+			CreatedBy: latest.CreatedBy,
+			Updated:   latest.Updated,
+			User:      latest.User,
+			Group:     latest.Group,
+			Privilege: latest.Privilege,
+			Resource:  latest.Resource,
+		}
+	}
+
+	addVersionHandler(a, http.MethodGet, "/api/grants", "0.18.1",
+		route[api.ListGrantsRequest, *api.ListResponse[grantV0_18_1]]{
+			routeSettings: defaultRouteSettingsGet,
+			handler: func(rCtx access.RequestContext, req *api.ListGrantsRequest) (*api.ListResponse[grantV0_18_1], error) {
+				resp, err := a.ListGrants(rCtx, req)
+				return api.CopyListResponse(resp, func(item api.Grant) grantV0_18_1 {
+					return *newGrantsV0_18_1FromLatest(&item)
+				}), err
+			},
+		})
+
+	addVersionHandler(a, http.MethodGet, "/api/grants/:id", "0.18.1",
+		route[api.Resource, *grantV0_18_1]{
+			routeSettings: defaultRouteSettingsGet,
+			handler: func(rCtx access.RequestContext, req *api.Resource) (*grantV0_18_1, error) {
+				resp, err := a.GetGrant(rCtx, req)
+				return newGrantsV0_18_1FromLatest(resp), err
+			},
+		})
+
+	type createGrantResponseV0_18_1 struct {
+		*grantV0_18_1 `json:",inline"`
+		WasCreated    bool `json:"wasCreated"`
+	}
+	addVersionHandler(a, http.MethodPost, "/api/grants", "0.18.1",
+		route[api.GrantRequest, *createGrantResponseV0_18_1]{
+			handler: func(rCtx access.RequestContext, req *api.GrantRequest) (*createGrantResponseV0_18_1, error) {
+				resp, err := a.CreateGrant(rCtx, req)
+				if err != nil {
+					return nil, err
+				}
+				return &createGrantResponseV0_18_1{
+					grantV0_18_1: newGrantsV0_18_1FromLatest(resp.Grant),
+					WasCreated:   resp.WasCreated,
+				}, nil
+			},
+		})
 }

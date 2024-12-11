@@ -4,9 +4,10 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"gotest.tools/v3/assert"
+
+	"github.com/infrahq/infra/internal/openapi3"
 )
 
 type StringExample struct {
@@ -22,6 +23,8 @@ func (s StringExample) ValidationRules() []ValidationRule {
 			MaxLength:           10,
 			CharacterRanges:     []CharRange{AlphabetLower, AlphabetUpper},
 			FirstCharacterRange: []CharRange{AlphabetLower},
+			RequiredCharacters:  []rune{'a'},
+			DenyList:            []string{"repudiate"},
 		},
 	}
 }
@@ -76,6 +79,28 @@ func TestStringRule_Validate(t *testing.T) {
 		}
 		assert.DeepEqual(t, verr, expected)
 	})
+	t.Run("required character not found", func(t *testing.T) {
+		r := StringExample{Field: "bcde"}
+		err := Validate(r)
+
+		var verr Error
+		assert.Assert(t, errors.As(err, &verr), "wrong type %T", err)
+		expected := Error{
+			"strField": {"'a' is required in value"},
+		}
+		assert.DeepEqual(t, verr, expected)
+	})
+	t.Run("denied value is rejected", func(t *testing.T) {
+		r := StringExample{Field: "repudiate"}
+		err := Validate(r)
+
+		var verr Error
+		assert.Assert(t, errors.As(err, &verr), "wrong type %T", err)
+		expected := Error{
+			"strField": {"\"repudiate\" is not an allowed value"},
+		}
+		assert.DeepEqual(t, verr, expected)
+	})
 }
 
 func TestStringRule_DescribeSchema(t *testing.T) {
@@ -94,9 +119,9 @@ func TestStringRule_DescribeSchema(t *testing.T) {
 
 	var max uint64 = 10
 	expected := openapi3.Schema{
-		Properties: openapi3.Schemas{
-			"street": &openapi3.SchemaRef{
-				Value: &openapi3.Schema{
+		Properties: map[string]*openapi3.SchemaRef{
+			"street": {
+				Schema: &openapi3.Schema{
 					MinLength: 2,
 					MaxLength: &max,
 					Format:    `[A-Z.\-]`,
@@ -154,9 +179,9 @@ func TestEnum_DescribeSchema(t *testing.T) {
 	e.DescribeSchema(&schema)
 
 	expected := openapi3.Schema{
-		Properties: openapi3.Schemas{
-			"kind": &openapi3.SchemaRef{
-				Value: &openapi3.Schema{
+		Properties: map[string]*openapi3.SchemaRef{
+			"kind": {
+				Schema: &openapi3.Schema{
 					Enum: []interface{}{"car", "truck", "bus"},
 				},
 			},

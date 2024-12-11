@@ -4,7 +4,6 @@ import (
 	"testing"
 
 	"gotest.tools/v3/assert"
-	is "gotest.tools/v3/assert/cmp"
 
 	"github.com/infrahq/infra/internal/server/data"
 	"github.com/infrahq/infra/internal/server/models"
@@ -29,7 +28,7 @@ CREATE TABLE struct_for_testings (
 func TestEncryptedAtRest(t *testing.T) {
 	patch.ModelsSymmetricKey(t)
 
-	db, err := data.NewDB(data.NewDBOptions{DSN: database.PostgresDriver(t, "_models").DSN})
+	db, err := data.NewDB(data.NewDBOptions{DSN: database.PostgresDriver(t, "models").DSN})
 	assert.NilError(t, err)
 
 	_, err = db.Exec(StructForTesting{}.Schema())
@@ -51,10 +50,8 @@ func TestEncryptedAtRest(t *testing.T) {
 
 	assert.Assert(t, "don't tell" != result)
 	assert.Assert(t, "" != result)
-	assert.Assert(t, is.Len(result, 88)) // encrypts to this many bytes
 
 	m2 := &StructForTesting{}
-
 	err = db.QueryRow(`SELECT a_secret FROM struct_for_testings where id = ?`, id).Scan(&m2.ASecret)
 	assert.NilError(t, err)
 
@@ -64,28 +61,28 @@ func TestEncryptedAtRest(t *testing.T) {
 func TestEncryptedAtRest_WithBytes(t *testing.T) {
 	patch.ModelsSymmetricKey(t)
 
-	db, err := data.NewDB(data.NewDBOptions{DSN: database.PostgresDriver(t, "_models").DSN})
+	db, err := data.NewDB(data.NewDBOptions{DSN: database.PostgresDriver(t, "models").DSN})
 	assert.NilError(t, err)
 
-	settings, err := data.GetSettings(db)
+	organization, err := data.GetOrganization(db, data.GetOrganizationOptions{ByID: db.DefaultOrg.ID})
 	assert.NilError(t, err)
 
 	t.Run("Scan", func(t *testing.T) {
 		var newEncrypted models.EncryptedAtRest
-		err := db.QueryRow(`SELECT private_jwk FROM settings WHERE id = ?`, settings.ID).Scan(&newEncrypted)
+		err := db.QueryRow(`SELECT private_jwk FROM organizations WHERE id = ?`, organization.ID).Scan(&newEncrypted)
 		assert.NilError(t, err)
 
-		assert.Equal(t, string(settings.PrivateJWK), string(newEncrypted))
+		assert.Equal(t, string(organization.PrivateJWK), string(newEncrypted))
 	})
 	t.Run("Value", func(t *testing.T) {
-		newEncrypted := settings.PrivateJWK
+		newEncrypted := organization.PrivateJWK
 
-		_, err := db.Exec(`UPDATE settings SET private_jwk = ? WHERE id = ?`, newEncrypted, settings.ID)
+		_, err := db.Exec(`UPDATE organizations SET private_jwk = ? WHERE id = ?`, newEncrypted, organization.ID)
 		assert.NilError(t, err)
 
-		updated, err := data.GetSettings(db)
+		updated, err := data.GetOrganization(db, data.GetOrganizationOptions{ByID: db.DefaultOrg.ID})
 		assert.NilError(t, err)
 
-		assert.Equal(t, string(updated.PrivateJWK), string(settings.PrivateJWK))
+		assert.Equal(t, string(updated.PrivateJWK), string(organization.PrivateJWK))
 	})
 }

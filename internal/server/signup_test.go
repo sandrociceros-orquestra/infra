@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path"
 	"regexp"
 	"strings"
 	"testing"
@@ -17,7 +19,6 @@ import (
 	"github.com/infrahq/infra/internal/server/data"
 	"github.com/infrahq/infra/internal/server/models"
 	"github.com/infrahq/infra/internal/server/providers"
-	"github.com/infrahq/infra/uid"
 )
 
 func TestAPI_Signup(t *testing.T) {
@@ -114,6 +115,9 @@ func TestAPI_SignupSocial(t *testing.T) {
 	srv.options.EnableSignup = true
 	srv.options.BaseDomain = "exampledomain.com"
 	srv.Google = &models.Provider{
+		Model: models.Model{
+			ID: models.InternalGoogleProviderID,
+		},
 		Name:         "Moogle",
 		URL:          "example.com",
 		ClientID:     "aaa",
@@ -342,7 +346,7 @@ func TestAPI_SignupSocial(t *testing.T) {
 	}
 }
 
-func TestAPI_SignupOrg(t *testing.T) {
+func TestAPI_SignupUserPass(t *testing.T) {
 	type testCase struct {
 		name     string
 		setup    func(t *testing.T) api.SignupRequest
@@ -416,11 +420,49 @@ func TestAPI_SignupOrg(t *testing.T) {
 				assert.NilError(t, err)
 
 				expected := []api.FieldError{
-					{FieldName: "user.password", Errors: []string{
-						"must be at least 8 characters",
+					{FieldName: "password", Errors: []string{
+						"8 characters",
 					}},
 				}
 				assert.DeepEqual(t, respBody.FieldErrors, expected)
+
+				// the org should have been rolled back
+				_, err = data.GetOrganization(srv.DB(), data.GetOrganizationOptions{
+					ByDomain: "hello.exampledomain.com",
+				})
+				assert.ErrorIs(t, err, internal.ErrNotFound)
+			},
+		},
+		{
+			name: "common password",
+			setup: func(t *testing.T) api.SignupRequest {
+				badPasswordsFile := path.Join(t.TempDir(), "bad-passwords")
+				t.Setenv("INFRA_SERVER_BAD_PASSWORDS_FILE", badPasswordsFile)
+				t.Cleanup(func() {
+					os.Remove(badPasswordsFile)
+				})
+				badPasswords := "badpassword"
+
+				err := os.WriteFile(badPasswordsFile, []byte(badPasswords), 0o600)
+				assert.NilError(t, err)
+
+				return api.SignupRequest{
+					User: &api.SignupUser{
+						UserName: "admin@example.com",
+						Password: "badpassword",
+					},
+					OrgName:   "My org is awesome",
+					Subdomain: "helloo",
+				}
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusBadRequest, resp.Body.String())
+
+				respBody := &api.Error{}
+				err := json.Unmarshal(resp.Body.Bytes(), respBody)
+				assert.NilError(t, err)
+
+				assert.ErrorContains(t, respBody, "cannot use a common password")
 
 				// the org should have been rolled back
 				_, err = data.GetOrganization(srv.DB(), data.GetOrganizationOptions{
@@ -603,7 +645,7 @@ func validateSuccessfulSignup(t *testing.T, db *data.Transaction, testSignup val
 	// check the user is an admin
 	db = db.WithOrgID(respBody.Organization.ID)
 	_, err = data.GetGrant(db, data.GetGrantOptions{
-		BySubject:   uid.NewIdentityPolymorphicID(userID),
+		BySubject:   models.NewSubjectForUser(userID),
 		ByResource:  access.ResourceInfraAPI,
 		ByPrivilege: api.InfraAdminRole,
 	})

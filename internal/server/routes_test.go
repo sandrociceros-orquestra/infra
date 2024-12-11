@@ -18,6 +18,7 @@ import (
 
 	"github.com/infrahq/infra/api"
 	"github.com/infrahq/infra/internal"
+	"github.com/infrahq/infra/internal/access"
 	"github.com/infrahq/infra/internal/server/data"
 	"github.com/infrahq/infra/internal/server/models"
 	"github.com/infrahq/infra/uid"
@@ -155,7 +156,7 @@ func TestTrimWhitespace(t *testing.T) {
 		Resource:  " kubernetes.production.*",
 	}))
 	req.Header.Add("Authorization", "Bearer "+adminAccessKey(srv))
-	req.Header.Add("Infra-Version", "0.13.1")
+	req.Header.Add("Infra-Version", apiVersionLatest)
 
 	resp := httptest.NewRecorder()
 	routes.ServeHTTP(resp, req)
@@ -164,7 +165,7 @@ func TestTrimWhitespace(t *testing.T) {
 	// nolint:noctx
 	req = httptest.NewRequest(http.MethodGet, "/api/grants?privilege=%20admin%20&userID="+userID.String(), nil)
 	req.Header.Add("Authorization", "Bearer "+adminAccessKey(srv))
-	req.Header.Add("Infra-Version", "0.13.1")
+	req.Header.Add("Infra-Version", apiVersionLatest)
 
 	resp = httptest.NewRecorder()
 	routes.ServeHTTP(resp, req)
@@ -188,9 +189,7 @@ func TestWrapRoute_TxnRollbackOnError(t *testing.T) {
 	router := gin.New()
 
 	r := route[api.EmptyRequest, *api.EmptyResponse]{
-		handler: func(c *gin.Context, request *api.EmptyRequest) (*api.EmptyResponse, error) {
-			rCtx := getRequestContext(c)
-
+		handler: func(rCtx access.RequestContext, request *api.EmptyRequest) (*api.EmptyResponse, error) {
 			user := &models.Identity{
 				Model:              models.Model{ID: 1555},
 				Name:               "user@example.com",
@@ -210,7 +209,7 @@ func TestWrapRoute_TxnRollbackOnError(t *testing.T) {
 	}
 
 	api := &API{server: srv}
-	add(api, rg(router.Group("/")), "POST", "/do", r)
+	add(api, newRouterGroup(router.Group("/")), "POST", "/do", r)
 
 	resp := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/do", nil)
@@ -228,9 +227,7 @@ func TestWrapRoute_HandleErrorOnCommit(t *testing.T) {
 	router := gin.New()
 
 	r := route[api.EmptyRequest, *api.EmptyResponse]{
-		handler: func(c *gin.Context, request *api.EmptyRequest) (*api.EmptyResponse, error) {
-			rCtx := getRequestContext(c)
-
+		handler: func(rCtx access.RequestContext, request *api.EmptyRequest) (*api.EmptyResponse, error) {
 			// Commit the transaction so that the call in wrapRoute returns an error
 			err := rCtx.DBTxn.Commit()
 			return nil, err
@@ -243,13 +240,17 @@ func TestWrapRoute_HandleErrorOnCommit(t *testing.T) {
 	}
 
 	api := &API{server: srv}
-	add(api, rg(router.Group("/")), "POST", "/do", r)
+	add(api, newRouterGroup(router.Group("/")), "POST", "/do", r)
 
 	resp := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/do", nil)
 	router.ServeHTTP(resp, req)
 
 	assert.Equal(t, resp.Code, http.StatusInternalServerError)
+}
+
+func newRouterGroup(g *gin.RouterGroup) *routeGroup {
+	return &routeGroup{RouterGroup: g, authenticationOptional: true, organizationOptional: true}
 }
 
 func TestInfraVersionHeader(t *testing.T) {
@@ -286,15 +287,13 @@ func TestRequestTimeout(t *testing.T) {
 	assert.Assert(t, ok)
 	a := &API{server: srv}
 
-	group := &routeGroup{RouterGroup: router.Group("/"), noAuthentication: true, noOrgRequired: true}
+	group := &routeGroup{RouterGroup: router.Group("/"), authenticationOptional: true, organizationOptional: true}
 	add(a, group, http.MethodGet, "/sleep", route[api.EmptyRequest, *api.EmptyResponse]{
-		handler: func(c *gin.Context, req *api.EmptyRequest) (*api.EmptyResponse, error) {
-			ctx := getRequestContext(c)
-
-			_, exist := ctx.Request.Context().Deadline()
+		handler: func(rCtx access.RequestContext, req *api.EmptyRequest) (*api.EmptyResponse, error) {
+			_, exist := rCtx.Request.Context().Deadline()
 			assert.Assert(t, exist)
 
-			_, err := ctx.DBTxn.Exec("select pg_sleep(2)")
+			_, err := rCtx.DBTxn.Exec("select pg_sleep(2)")
 			assert.Error(t, err, "timeout: context deadline exceeded", "expected this query to time out and get cancelled")
 
 			return nil, err
@@ -302,7 +301,7 @@ func TestRequestTimeout(t *testing.T) {
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/sleep", nil)
-	req.Header.Add("Infra-Version", "0.13.1")
+	req.Header.Add("Infra-Version", apiVersionLatest)
 
 	resp := httptest.NewRecorder()
 	started := time.Now()

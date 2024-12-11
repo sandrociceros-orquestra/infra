@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -58,9 +59,9 @@ func TestAPI_GetOrganization(t *testing.T) {
 	idMe := createID(t, "me@example.com")
 
 	token := &models.AccessKey{
-		IssuedFor:  idMe,
-		ProviderID: data.InfraProvider(srv.DB()).ID,
-		ExpiresAt:  time.Now().Add(10 * time.Second),
+		IssuedForID: idMe,
+		ProviderID:  data.InfraProvider(srv.DB()).ID,
+		ExpiresAt:   time.Now().Add(10 * time.Second),
 	}
 
 	accessKeyMe, err := data.CreateAccessKey(srv.DB(), token)
@@ -74,7 +75,7 @@ func TestAPI_GetOrganization(t *testing.T) {
 
 	run := func(t *testing.T, tc testCase) {
 		req := httptest.NewRequest(http.MethodGet, tc.urlPath, nil)
-		req.Header.Add("Infra-Version", "0.15.2")
+		req.Header.Add("Infra-Version", apiVersionLatest)
 
 		if tc.setup != nil {
 			tc.setup(t, req)
@@ -202,7 +203,7 @@ func TestAPI_ListOrganizations(t *testing.T) {
 
 	run := func(t *testing.T, tc testCase) {
 		req := httptest.NewRequest(http.MethodGet, tc.urlPath, nil)
-		req.Header.Add("Infra-Version", "0.14.1")
+		req.Header.Add("Infra-Version", apiVersionLatest)
 
 		if tc.setup != nil {
 			tc.setup(t, req)
@@ -275,7 +276,7 @@ func TestAPI_CreateOrganization(t *testing.T) {
 		body := jsonBody(t, tc.body)
 		// nolint:noctx
 		req := httptest.NewRequest(http.MethodPost, "/api/organizations", body)
-		req.Header.Add("Infra-Version", "0.14.1")
+		req.Header.Add("Infra-Version", apiVersionLatest)
 		ctx := providers.WithOIDCClient(req.Context(), &fakeOIDCImplementation{})
 		*req = *req.WithContext(ctx)
 
@@ -353,7 +354,7 @@ func TestAPI_DeleteOrganization(t *testing.T) {
 	run := func(t *testing.T, tc testCase) {
 		// nolint:noctx
 		req := httptest.NewRequest(http.MethodDelete, tc.urlPath, nil)
-		req.Header.Add("Infra-Version", "0.14.1")
+		req.Header.Add("Infra-Version", apiVersionLatest)
 
 		if tc.setup != nil {
 			tc.setup(t, req)
@@ -384,6 +385,241 @@ func TestAPI_DeleteOrganization(t *testing.T) {
 				assert.Equal(t, resp.Code, http.StatusNoContent, resp.Body.String())
 				_, err := data.GetOrganization(srv.DB(), data.GetOrganizationOptions{ByID: first.ID})
 				assert.ErrorIs(t, err, internal.ErrNotFound)
+			},
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			run(t, tc)
+		})
+	}
+}
+
+func TestAPI_UpdateOrganization(t *testing.T) {
+	srv := setupServer(t, withAdminUser, withSupportAdminGrant, withMultiOrgEnabled)
+	routes := srv.GenerateRoutes()
+
+	org := models.Organization{Name: "update-org", Domain: "update.example.com"}
+
+	createOrgs(t, srv.DB(), &org)
+	tx := txnForTestCase(t, srv.db, org.ID)
+
+	createID := func(t *testing.T, name string) uid.ID {
+		t.Helper()
+		var buf bytes.Buffer
+		body := api.CreateUserRequest{Name: name}
+		err := json.NewEncoder(&buf).Encode(body)
+		assert.NilError(t, err)
+
+		// nolint:noctx
+		req := httptest.NewRequest(http.MethodPost, "/api/users", &buf)
+		req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
+		req.Header.Set("Infra-Version", apiVersionLatest)
+
+		resp := httptest.NewRecorder()
+		routes.ServeHTTP(resp, req)
+		assert.Equal(t, resp.Code, http.StatusCreated, resp.Body.String())
+		respObj := &api.CreateUserResponse{}
+		err = json.Unmarshal(resp.Body.Bytes(), respObj)
+		assert.NilError(t, err)
+		return respObj.ID
+	}
+	idDiffOrg := createID(t, "me@example.com")
+
+	token := &models.AccessKey{
+		IssuedForID: idDiffOrg,
+		ExpiresAt:   time.Now().Add(10 * time.Second),
+	}
+
+	accessDifferentOrg, err := data.CreateAccessKey(srv.DB(), token)
+	assert.NilError(t, err)
+
+	// create a user in the testing org
+	user := &models.Identity{
+		Name: "joe@example.com",
+	}
+	assert.NilError(t, data.CreateIdentity(tx, user))
+
+	userAccess := &models.AccessKey{
+		Name:          "org key",
+		IssuedForID:   user.ID,
+		IssuedForName: user.Name,
+		IssuedForKind: models.IssuedForKindUser,
+		ExpiresAt:     time.Now().Add(10 * time.Minute).UTC().Truncate(time.Second),
+	}
+	userKey, err := data.CreateAccessKey(tx, userAccess)
+	assert.NilError(t, err)
+
+	// create an admin user in the testing org
+	admin := &models.Identity{
+		Name: "alice@example.com",
+	}
+	assert.NilError(t, data.CreateIdentity(tx, admin))
+
+	adminGrant := &models.Grant{
+		Subject:   models.NewSubjectForUser(admin.ID),
+		Privilege: "admin",
+		Resource:  "infra",
+	}
+	assert.NilError(t, data.CreateGrant(tx, adminGrant))
+
+	adminAccessKey := &models.AccessKey{
+		OrganizationMember: models.OrganizationMember{OrganizationID: org.ID},
+		Name:               "org admin key",
+		IssuedForID:        admin.ID,
+		IssuedForName:      admin.Name,
+		IssuedForKind:      models.IssuedForKindUser,
+		ExpiresAt:          time.Now().Add(10 * time.Minute).UTC().Truncate(time.Second),
+	}
+	adminKey, err := data.CreateAccessKey(tx, adminAccessKey)
+	assert.NilError(t, err)
+
+	unauthorizedKey, _ := createAccessKey(t, tx, "someonenew@example.com")
+
+	assert.NilError(t, tx.Commit())
+
+	type testCase struct {
+		urlPath  string
+		body     api.UpdateOrganizationRequest
+		setup    func(t *testing.T, req *http.Request)
+		expected func(t *testing.T, resp *httptest.ResponseRecorder)
+	}
+
+	run := func(t *testing.T, tc testCase) {
+		body := jsonBody(t, tc.body)
+		req := httptest.NewRequest(http.MethodPut, tc.urlPath, body)
+		req.Header.Add("Infra-Version", apiVersionLatest)
+
+		if tc.setup != nil {
+			tc.setup(t, req)
+		}
+
+		resp := httptest.NewRecorder()
+		routes.ServeHTTP(resp, req)
+
+		tc.expected(t, resp)
+	}
+
+	testCases := map[string]testCase{
+		"not authenticated": {
+			urlPath: "/api/organizations/" + org.ID.String(),
+			body: api.UpdateOrganizationRequest{
+				AllowedDomains: []string{"fail.example.com"},
+			},
+			setup: func(t *testing.T, req *http.Request) {
+				req.Header.Del("Authorization")
+				req.Host = "update.example.com"
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusUnauthorized)
+			},
+		},
+		"not authorized": {
+			urlPath: "/api/organizations/" + org.ID.String(),
+			body: api.UpdateOrganizationRequest{
+				AllowedDomains: []string{"fail.example.com"},
+			},
+			setup: func(t *testing.T, req *http.Request) {
+				req.Header.Set("Authorization", "Bearer "+unauthorizedKey)
+				req.Host = "update.example.com"
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusForbidden)
+			},
+		},
+		"fails to update organization for a different org": {
+			urlPath: "/api/organizations/" + org.ID.String(),
+			body: api.UpdateOrganizationRequest{
+				AllowedDomains: []string{"fail.example.com"},
+			},
+			setup: func(t *testing.T, req *http.Request) {
+				req.Header.Set("Authorization", "Bearer "+accessDifferentOrg)
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusForbidden)
+			},
+		},
+		"fails to update allowed domains with no organization admin grant": {
+			urlPath: "/api/organizations/" + org.ID.String(),
+			body: api.UpdateOrganizationRequest{
+				AllowedDomains: []string{"hello.example.com", "hi.example.com"},
+			},
+			setup: func(t *testing.T, req *http.Request) {
+				req.Header.Set("Authorization", "Bearer "+userKey)
+				req.Host = "update.example.com"
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusForbidden)
+			},
+		},
+		"fails to update allowed domains when a domain is invalid": {
+			urlPath: "/api/organizations/" + org.ID.String(),
+			body: api.UpdateOrganizationRequest{
+				AllowedDomains: []string{"hello.example.com", "@example.com"},
+			},
+			setup: func(t *testing.T, req *http.Request) {
+				req.Header.Set("Authorization", "Bearer "+adminKey)
+				req.Host = "update.example.com"
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusBadRequest)
+				respBody := &api.Error{}
+				err := json.Unmarshal(resp.Body.Bytes(), respBody)
+				assert.NilError(t, err)
+
+				assert.Assert(t, strings.Contains(respBody.Message, "first character '@' is not allowed"), respBody.Message)
+			},
+		},
+		"can update allowed domains when organization admin": {
+			urlPath: "/api/organizations/" + org.ID.String(),
+			body: api.UpdateOrganizationRequest{
+				AllowedDomains: []string{"hello.example.com", "hi.example.com"},
+			},
+			setup: func(t *testing.T, req *http.Request) {
+				req.Header.Set("Authorization", "Bearer "+adminKey)
+				req.Host = "update.example.com"
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusOK)
+
+				actual := &api.Organization{}
+				err := json.Unmarshal(resp.Body.Bytes(), actual)
+				assert.NilError(t, err)
+				expected := &api.Organization{
+					ID:             actual.ID, // does not matter
+					Name:           org.Name,
+					Created:        actual.Created, // does not matter
+					Updated:        actual.Updated, // does not matter
+					Domain:         org.Domain,
+					AllowedDomains: []string{"hello.example.com", "hi.example.com"},
+				}
+				assert.DeepEqual(t, actual, expected)
+			},
+		},
+		"duplicate allowed domains are ignored": {
+			urlPath: "/api/organizations/" + org.ID.String(),
+			body: api.UpdateOrganizationRequest{
+				AllowedDomains: []string{"hello.example.com", "hello.example.com"},
+			},
+			setup: func(t *testing.T, req *http.Request) {
+				req.Header.Set("Authorization", "Bearer "+adminKey)
+				req.Host = "update.example.com"
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusOK)
+
+				actual := &api.Organization{}
+				err := json.Unmarshal(resp.Body.Bytes(), actual)
+				assert.NilError(t, err)
+				expected := &api.Organization{
+					ID:             actual.ID, // does not matter
+					Name:           org.Name,
+					Created:        actual.Created, // does not matter
+					Updated:        actual.Updated, // does not matter
+					Domain:         org.Domain,
+					AllowedDomains: []string{"hello.example.com"},
+				}
+				assert.DeepEqual(t, actual, expected)
 			},
 		},
 	}

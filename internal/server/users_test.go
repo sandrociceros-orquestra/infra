@@ -12,15 +12,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	gocmp "github.com/google/go-cmp/cmp"
 	"golang.org/x/crypto/bcrypt"
 	"gotest.tools/v3/assert"
 
 	"github.com/infrahq/infra/api"
+	"github.com/infrahq/infra/internal"
 	"github.com/infrahq/infra/internal/access"
 	"github.com/infrahq/infra/internal/generate"
 	"github.com/infrahq/infra/internal/server/data"
+	"github.com/infrahq/infra/internal/server/email"
 	"github.com/infrahq/infra/internal/server/models"
 	"github.com/infrahq/infra/uid"
 )
@@ -53,16 +54,16 @@ func TestAPI_GetUser(t *testing.T) {
 	idHal := createID(t, "HAL@example.com")
 
 	token := &models.AccessKey{
-		IssuedFor:  idMe,
-		ProviderID: data.InfraProvider(srv.DB()).ID,
-		ExpiresAt:  time.Now().Add(10 * time.Second),
+		IssuedForID: idMe,
+		ProviderID:  data.InfraProvider(srv.DB()).ID,
+		ExpiresAt:   time.Now().Add(10 * time.Second),
 	}
 
 	accessKeyMe, err := data.CreateAccessKey(srv.DB(), token)
 	assert.NilError(t, err)
 
 	pubKey := `ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDPkW3mIACvMmXqbeGF/U2MY8jbQ5NT24tRL0cl+32vRMmIDGcEyLkWh98D9qJlwCIZ8vJahAI3sqYJRoIHkiaRTslWwAZWNnTJ3TzeKUn/g0xutASD4znmQhNk3OuKPyuDKRxvsOuBVzuKiNNeUWVf5v/4gPrmBffS19cPPlHG+TwHNzTvyvbLcZu+xE18x8eCM4uRam0wa4RfHrMtaqPb/kFGz7skXv0/JFCXKrc//dMKHbr/brjj7fKYFYbMG7k15LewfZ/fLqsbJsvuP8OTIE7195fKhL1Gln8AKOM1E0CLX9nxK7qx4MlrDgEJBbqikWb2kVKmpxwcA7UcoUbwKZb4/QrOUDy22aHnIErIl2is9IP8RfBdKgzmgT1QmVPcGHI4gBAPb279zw58nAVp58gzHvK/oTDlAD2zq87i/PeDSzdoVZe0zliKOXAVzLQGI+9vsZ+6URHBe6J+Tj+PxOD5sWduhepOa/UKF96+CeEg/oso4UHR83z5zR38idc=`
-	addUserPublicKey(t, srv.DB(), idMe, pubKey)
+	userPubKey := addUserPublicKey(t, srv.DB(), idMe, pubKey)
 
 	type testCase struct {
 		urlPath  string
@@ -131,9 +132,9 @@ func TestAPI_GetUser(t *testing.T) {
 			urlPath: "/api/users/self",
 			setup: func(t *testing.T, req *http.Request) {
 				token := &models.AccessKey{
-					IssuedFor:  idMe,
-					ProviderID: data.InfraProvider(srv.DB()).ID,
-					ExpiresAt:  time.Now().Add(10 * time.Second),
+					IssuedForID: idMe,
+					ProviderID:  data.InfraProvider(srv.DB()).ID,
+					ExpiresAt:   time.Now().Add(10 * time.Second),
 				}
 
 				key, err := data.CreateAccessKey(srv.DB(), token)
@@ -171,6 +172,7 @@ func TestAPI_GetUser(t *testing.T) {
 							{
 								"id": "<any-valid-uid>",
 								"created": "%[2]v",
+								"expires": "%[4]v",
 								"fingerprint": "SHA256:dwF3R8L454kABUAJc+ZdJeaV2xbcXVJfb81tuv/1KLo",
 								"publicKey": "%[3]v",
 								"keyType": "ssh-rsa",
@@ -181,10 +183,11 @@ func TestAPI_GetUser(t *testing.T) {
 					idMe.String(),
 					time.Now().UTC().Format(time.RFC3339),
 					strings.Fields(pubKey)[1],
+					userPubKey.Expires.Time().UTC().Format(time.RFC3339),
 				))
 				actual := jsonUnmarshal(t, resp.Body.String())
 
-				var cmpAPIUserJSON = gocmp.Options{
+				cmpAPIUserJSON := gocmp.Options{
 					gocmp.FilterPath(pathMapKey(`created`, `updated`, `lastSeenAt`), cmpApproximateTime),
 					gocmp.FilterPath(pathMapKey(`id`), cmpAnyValidUID),
 				}
@@ -200,18 +203,17 @@ func TestAPI_GetUser(t *testing.T) {
 	}
 }
 
-func addUserPublicKey(t *testing.T, db *data.DB, userID uid.ID, key string) {
+func addUserPublicKey(t *testing.T, db *data.DB, userID uid.ID, key string) *api.UserPublicKey {
 	t.Helper()
 	tx := txnForTestCase(t, db, db.DefaultOrg.ID)
-	c, _ := gin.CreateTestContext(nil)
 	rCtx := access.RequestContext{}
 	rCtx.DBTxn = tx
 	rCtx.Authenticated.User = &models.Identity{Model: models.Model{ID: userID}}
-	c.Set(access.RequestContextKey, rCtx)
 
-	_, err := AddUserPublicKey(c, &api.AddUserPublicKeyRequest{PublicKey: key})
+	resp, err := AddUserPublicKey(rCtx, &api.AddUserPublicKeyRequest{PublicKey: key})
 	assert.NilError(t, err)
 	assert.NilError(t, tx.Commit())
+	return resp
 }
 
 func TestAPI_ListUsers(t *testing.T) {
@@ -635,13 +637,11 @@ func TestAPI_CreateUserAndUpdatePassword(t *testing.T) {
 	a := &API{server: srv}
 	admin := createAdmin(t, db)
 
-	loginAs := func(tx *data.Transaction, user *models.Identity) *gin.Context {
-		ctx, _ := gin.CreateTestContext(nil)
-		ctx.Set(access.RequestContextKey, access.RequestContext{
+	loginAs := func(tx *data.Transaction, user *models.Identity) access.RequestContext {
+		return access.RequestContext{
 			DBTxn:         tx,
 			Authenticated: access.Authenticated{User: user},
-		})
-		return ctx
+		}
 	}
 
 	t.Run("with an IDP user existing", func(t *testing.T) {
@@ -691,7 +691,7 @@ func TestAPI_CreateUserAndUpdatePassword(t *testing.T) {
 						OldPassword: "whatever",
 						Password:    "1234567890987654321a!",
 					})
-					assert.Error(t, err, "existing credential: record not found")
+					assert.Error(t, err, "get credential: record not found")
 				})
 			})
 			t.Run("with an existing infra user", func(t *testing.T) {
@@ -773,6 +773,80 @@ func TestAPI_CreateUserAndUpdatePassword(t *testing.T) {
 	})
 }
 
+func TestAPI_CreateUser_EmailInvite(t *testing.T) {
+	s := setupServer(t, withAdminUser)
+	routes := s.GenerateRoutes()
+
+	var token string
+	runStep(t, "request user invite", func(t *testing.T) {
+		patchEmailTestMode(t, "fakekey")
+
+		body := jsonBody(t, &api.CreateUserRequest{Name: "deckard@example.com"})
+		r := httptest.NewRequest(http.MethodPost, "/api/users", body)
+		r.Header.Add("Infra-Version", apiVersionLatest)
+		r.Header.Add("Authorization", fmt.Sprintf("Bearer %s", adminAccessKey(s)))
+
+		w := httptest.NewRecorder()
+		routes.ServeHTTP(w, r)
+		assert.Equal(t, w.Code, http.StatusCreated, w.Body.String())
+		assert.Equal(t, len(email.TestData), 1)
+
+		data, ok := email.TestData[0].(email.UserInviteData)
+		assert.Assert(t, ok)
+
+		assert.Equal(t, data.FromUserName, "Admin")
+
+		u, err := url.Parse(data.Link)
+		assert.NilError(t, err)
+		assert.Equal(t, u.Path, "/accept-invite")
+
+		token = u.Query().Get("token")
+		assert.Assert(t, token != "")
+	})
+
+	user, err := data.GetIdentity(s.DB(), data.GetIdentityOptions{ByName: "deckard@example.com"})
+	assert.NilError(t, err)
+
+	_, err = data.GetCredentialByUserID(s.DB(), user.ID)
+	assert.ErrorIs(t, err, internal.ErrNotFound)
+
+	_, err = data.GetProviderUser(s.DB(), data.InfraProvider(s.DB()).ID, user.ID)
+	assert.ErrorIs(t, err, internal.ErrNotFound)
+
+	// an invite is claimed by submitting a password reset request with the invite token
+	runStep(t, "claim invite token", func(t *testing.T) {
+		body := jsonBody(t, &api.VerifiedResetPasswordRequest{Token: token, Password: "mysecret"})
+		r := httptest.NewRequest(http.MethodPost, "/api/password-reset", body)
+		r.Header.Add("Infra-Version", apiVersionLatest)
+
+		w := httptest.NewRecorder()
+		routes.ServeHTTP(w, r)
+		assert.Equal(t, w.Code, http.StatusCreated, w.Body.String())
+
+		credential, err := data.GetCredentialByUserID(s.DB(), user.ID)
+		assert.NilError(t, err)
+
+		err = bcrypt.CompareHashAndPassword(credential.PasswordHash, []byte("mysecret"))
+		assert.NilError(t, err)
+
+		_, err = data.GetProviderUser(s.DB(), data.InfraProvider(s.DB()).ID, user.ID)
+		assert.NilError(t, err)
+	})
+
+	runStep(t, "no duplicates", func(t *testing.T) {
+		patchEmailTestMode(t, "fakekey")
+
+		body := jsonBody(t, &api.CreateUserRequest{Name: "deckard@example.com"})
+		r := httptest.NewRequest(http.MethodPost, "/api/users", body)
+		r.Header.Add("Infra-Version", apiVersionLatest)
+		r.Header.Add("Authorization", fmt.Sprintf("Bearer %s", adminAccessKey(s)))
+
+		w := httptest.NewRecorder()
+		routes.ServeHTTP(w, r)
+		assert.Equal(t, w.Code, http.StatusBadRequest, w.Body.String())
+	})
+}
+
 func TestAPI_DeleteUser(t *testing.T) {
 	srv := setupServer(t, withAdminUser)
 	routes := srv.GenerateRoutes()
@@ -787,20 +861,12 @@ func TestAPI_DeleteUser(t *testing.T) {
 
 	type testCase struct {
 		name     string
-		urlPath  string
-		setup    func(t *testing.T, req *http.Request)
+		setup    func(t *testing.T) *http.Request
 		expected func(t *testing.T, resp *httptest.ResponseRecorder)
 	}
 
 	run := func(t *testing.T, tc testCase) {
-		// nolint:noctx
-		req := httptest.NewRequest(http.MethodDelete, tc.urlPath, nil)
-		req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
-		req.Header.Set("Infra-Version", apiVersionLatest)
-
-		if tc.setup != nil {
-			tc.setup(t, req)
-		}
+		req := tc.setup(t)
 		resp := httptest.NewRecorder()
 		routes.ServeHTTP(resp, req)
 
@@ -808,30 +874,90 @@ func TestAPI_DeleteUser(t *testing.T) {
 	}
 
 	testCases := []testCase{
-		// TODO: not authenticated
-		// TODO: not authorized
 		{
-			name:    "can not delete internal users",
-			urlPath: "/api/users/" + connector.ID.String(),
+			name: "can not delete internal users",
+			setup: func(t *testing.T) *http.Request {
+				// nolint:noctx
+				req := httptest.NewRequest(http.MethodDelete, "/api/users/"+connector.ID.String(), nil)
+				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
+				req.Header.Set("Infra-Version", apiVersionLatest)
+				return req
+			},
 			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
 				assert.Equal(t, http.StatusBadRequest, resp.Code, resp.Body.String())
 			},
 		},
 		{
-			name:    "can not delete self",
-			urlPath: "/api/users/" + selfUser.ID.String(),
-			setup: func(t *testing.T, req *http.Request) {
+			name: "can not delete self",
+			setup: func(t *testing.T) *http.Request {
+				// nolint:noctx
+				req := httptest.NewRequest(http.MethodDelete, "/api/users/"+selfUser.ID.String(), nil)
 				req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", selfKey))
+				req.Header.Set("Infra-Version", apiVersionLatest)
+				return req
 			},
 			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
 				assert.Equal(t, http.StatusBadRequest, resp.Code, resp.Body.String())
 			},
 		},
 		{
-			name:    "success",
-			urlPath: "/api/users/" + testUser.ID.String(),
+			name: "cannot delete users when not authenticated",
+			setup: func(t *testing.T) *http.Request {
+				// nolint:noctx
+				req := httptest.NewRequest(http.MethodDelete, "/api/users/"+testUser.ID.String(), nil)
+				req.Header.Set("Infra-Version", apiVersionLatest)
+				return req
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, http.StatusUnauthorized, resp.Code, resp.Body.String())
+			},
+		},
+		{
+			name: "cannot delete users when not authorized",
+			setup: func(t *testing.T) *http.Request {
+				// nolint:noctx
+				req := httptest.NewRequest(http.MethodDelete, "/api/users/"+testUser.ID.String(), nil)
+				req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", selfKey))
+				req.Header.Set("Infra-Version", apiVersionLatest)
+				return req
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, http.StatusForbidden, resp.Code, resp.Body.String())
+			},
+		},
+		{
+			name: "success",
+			setup: func(t *testing.T) *http.Request {
+				// create associated resources which should also be deleted
+				hash, err := bcrypt.GenerateFromPassword([]byte("password"), bcrypt.DefaultCost)
+				assert.NilError(t, err)
+				assert.NilError(t, data.CreateCredential(srv.DB(), &models.Credential{IdentityID: testUser.ID, PasswordHash: hash}))
+
+				group := &models.Group{
+					Name: "test group",
+				}
+				assert.NilError(t, data.CreateGroup(srv.DB(), group))
+				assert.NilError(t, data.AddUsersToGroup(srv.DB(), group.ID, []uid.ID{testUser.ID}))
+				assert.NilError(t, data.CreateGrant(srv.DB(), &models.Grant{Subject: models.NewSubjectForUser(testUser.ID), Privilege: "admin", Resource: "infra"}))
+
+				// nolint:noctx
+				req := httptest.NewRequest(http.MethodDelete, "/api/users/"+testUser.ID.String(), nil)
+				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
+				req.Header.Set("Infra-Version", apiVersionLatest)
+				return req
+			},
 			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
 				assert.Equal(t, http.StatusNoContent, resp.Code, resp.Body.String())
+
+				// associated resources are deleted
+				_, err := data.GetCredentialByUserID(srv.DB(), testUser.ID)
+				assert.ErrorIs(t, err, internal.ErrNotFound)
+				groups, err := data.ListGroups(srv.DB(), data.ListGroupsOptions{ByGroupMember: testUser.ID})
+				assert.NilError(t, err)
+				assert.Equal(t, len(groups), 0)
+				grants, err := data.ListGrants(srv.DB(), data.ListGrantsOptions{BySubject: models.NewSubjectForUser(testUser.ID)})
+				assert.NilError(t, err)
+				assert.Equal(t, len(grants), 0)
 			},
 		},
 	}
@@ -847,97 +973,190 @@ func TestAPI_UpdateUser(t *testing.T) {
 	srv := setupServer(t, withAdminUser)
 	routes := srv.GenerateRoutes()
 
-	user := &models.Identity{Name: "salsa@example.com"}
-	err := data.CreateIdentity(srv.DB(), user)
-	assert.NilError(t, err)
+	run := func(t *testing.T, request *api.UpdateUserRequest, id, accessKey string) *httptest.ResponseRecorder {
+		body := jsonBody(t, request)
 
-	type testCase struct {
-		name     string
-		body     api.UpdateUserRequest
-		setup    func(t *testing.T, req *http.Request)
-		expected func(t *testing.T, response *httptest.ResponseRecorder)
-	}
+		r := httptest.NewRequest(http.MethodPut, "/api/users/"+id, body)
+		r.Header.Set("Infra-Version", apiVersionLatest)
 
-	run := func(t *testing.T, tc testCase) {
-		body := jsonBody(t, tc.body)
-
-		id := user.ID.String()
-		// nolint:noctx
-		req := httptest.NewRequest(http.MethodPut, "/api/users/"+id, body)
-		req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
-		req.Header.Set("Infra-Version", apiVersionLatest)
-
-		if tc.setup != nil {
-			tc.setup(t, req)
+		if accessKey != "" {
+			r.Header.Set("Authorization", "Bearer "+accessKey)
 		}
 
-		resp := httptest.NewRecorder()
-		routes.ServeHTTP(resp, req)
-
-		tc.expected(t, resp)
+		w := httptest.NewRecorder()
+		routes.ServeHTTP(w, r)
+		return w
 	}
 
-	testCases := []testCase{
-		{
-			name: "not authenticated",
-			setup: func(t *testing.T, req *http.Request) {
-				req.Header.Del("Authorization")
-			},
-			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
-				assert.Equal(t, resp.Code, http.StatusUnauthorized, resp.Body.String())
-			},
-		},
-		{
-			name: "not authorized",
-			body: api.UpdateUserRequest{Password: "new-password"},
-			setup: func(t *testing.T, req *http.Request) {
-				accessKey, _ := createAccessKey(t, srv.DB(), "usera@example.com")
-				req.Header.Set("Authorization", "Bearer "+accessKey)
-			},
-			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
-				assert.Equal(t, resp.Code, http.StatusForbidden, resp.Body.String())
-			},
-		},
-		// TODO: authorized by self
-		{
-			name: "missing required fields",
-			body: api.UpdateUserRequest{},
-			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
-				assert.Equal(t, resp.Code, http.StatusBadRequest, resp.Body.String())
+	t.Run("update own user", func(t *testing.T) {
+		user := &models.Identity{Name: "salsa@example.com"}
+		err := data.CreateIdentity(srv.DB(), user)
+		assert.NilError(t, err)
 
-				respBody := &api.Error{}
-				err := json.Unmarshal(resp.Body.Bytes(), respBody)
-				assert.NilError(t, err)
+		accessKey := &models.AccessKey{IssuedForID: user.ID, ProviderID: data.InfraProvider(srv.DB()).ID}
+		accessKeySecret, err := data.CreateAccessKey(srv.DB(), accessKey)
+		assert.NilError(t, err)
 
-				expected := []api.FieldError{
-					{FieldName: "password", Errors: []string{"is required"}},
-				}
-				assert.DeepEqual(t, respBody.FieldErrors, expected)
-			},
-		},
-		{
-			name: "invalid password",
-			body: api.UpdateUserRequest{Password: "short"},
-			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
-				assert.Equal(t, resp.Code, http.StatusBadRequest, resp.Body.String())
-
-				respBody := &api.Error{}
-				err := json.Unmarshal(resp.Body.Bytes(), respBody)
-				assert.NilError(t, err)
-
-				expected := []api.FieldError{
-					{FieldName: "password", Errors: []string{"8 characters"}},
-				}
-				assert.DeepEqual(t, respBody.FieldErrors, expected)
-			},
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			run(t, tc)
+		t.Run("cannot create their own credential", func(t *testing.T) {
+			response := run(t, &api.UpdateUserRequest{}, user.ID.String(), accessKeySecret)
+			assert.Equal(t, response.Code, http.StatusNotFound, response.Body.String())
 		})
-	}
+
+		hash, err := bcrypt.GenerateFromPassword([]byte("supersecret"), bcrypt.DefaultCost)
+		assert.NilError(t, err)
+
+		err = data.CreateCredential(srv.DB(), &models.Credential{IdentityID: user.ID, PasswordHash: hash})
+		assert.NilError(t, err)
+
+		t.Run("unauthenticated", func(t *testing.T) {
+			request := &api.UpdateUserRequest{}
+			response := run(t, request, user.ID.String(), "")
+			assert.Equal(t, response.Code, http.StatusUnauthorized, response.Body.String())
+		})
+
+		t.Run("old password empty", func(t *testing.T) {
+			request := &api.UpdateUserRequest{}
+			response := run(t, request, user.ID.String(), accessKeySecret)
+			assert.Equal(t, response.Code, http.StatusBadRequest, response.Body.String())
+
+			var body api.Error
+			err := json.Unmarshal(response.Body.Bytes(), &body)
+			assert.NilError(t, err)
+
+			expected := []api.FieldError{{FieldName: "oldPassword", Errors: []string{"invalid password"}}}
+			assert.DeepEqual(t, body.FieldErrors, expected)
+		})
+
+		t.Run("old password mismatch", func(t *testing.T) {
+			request := &api.UpdateUserRequest{OldPassword: "notsupersecret"}
+			response := run(t, request, user.ID.String(), accessKeySecret)
+			assert.Equal(t, response.Code, http.StatusBadRequest, response.Body.String())
+
+			var body api.Error
+			err := json.Unmarshal(response.Body.Bytes(), &body)
+			assert.NilError(t, err)
+
+			expected := []api.FieldError{{FieldName: "oldPassword", Errors: []string{"invalid password"}}}
+			assert.DeepEqual(t, body.FieldErrors, expected)
+		})
+
+		t.Run("new password invalid", func(t *testing.T) {
+			request := &api.UpdateUserRequest{OldPassword: "supersecret", Password: "short"}
+			response := run(t, request, user.ID.String(), accessKeySecret)
+			assert.Equal(t, response.Code, http.StatusBadRequest, response.Body.String())
+
+			var body api.Error
+			err := json.Unmarshal(response.Body.Bytes(), &body)
+			assert.NilError(t, err)
+
+			expected := []api.FieldError{{FieldName: "password", Errors: []string{"8 characters"}}}
+			assert.DeepEqual(t, body.FieldErrors, expected)
+		})
+
+		t.Run("can change their own password", func(t *testing.T) {
+			request := &api.UpdateUserRequest{OldPassword: "supersecret", Password: "mysecret"}
+			response := run(t, request, user.ID.String(), accessKeySecret)
+			assert.Equal(t, response.Code, http.StatusOK, response.Body.String())
+
+			var body api.UpdateUserResponse
+			err := json.Unmarshal(response.Body.Bytes(), &body)
+			assert.NilError(t, err)
+
+			assert.Equal(t, body.OneTimePassword, "")
+		})
+
+		t.Run("changing own password unsets password reset scope", func(t *testing.T) {
+			accessKey := &models.AccessKey{
+				IssuedForID: user.ID,
+				ProviderID:  data.InfraProvider(srv.DB()).ID,
+				Scopes:      models.CommaSeparatedStrings{models.ScopePasswordReset},
+			}
+
+			accessKeySecret, err := data.CreateAccessKey(srv.DB(), accessKey)
+			assert.NilError(t, err)
+
+			request := &api.UpdateUserRequest{OldPassword: "mysecret", Password: "mysecret"}
+			response := run(t, request, user.ID.String(), accessKeySecret)
+			assert.Equal(t, response.Code, http.StatusOK, response.Body.String())
+
+			accessKey, err = data.GetAccessKey(srv.DB(), data.GetAccessKeysOptions{ByID: accessKey.ID})
+			assert.NilError(t, err)
+			assert.DeepEqual(t, accessKey.Scopes, models.CommaSeparatedStrings{})
+		})
+	})
+
+	t.Run("update other users", func(t *testing.T) {
+		user := &models.Identity{Name: "tango@example.com"}
+		err := data.CreateIdentity(srv.DB(), user)
+		assert.NilError(t, err)
+
+		t.Run("unauthenticated", func(t *testing.T) {
+			request := &api.UpdateUserRequest{}
+			response := run(t, request, user.ID.String(), "")
+			assert.Equal(t, response.Code, http.StatusUnauthorized, response.Body.String())
+		})
+
+		t.Run("unauthorized", func(t *testing.T) {
+			accessKey, _ := createAccessKey(t, srv.DB(), "notadmin@example.com")
+
+			request := &api.UpdateUserRequest{}
+			response := run(t, request, user.ID.String(), accessKey)
+			assert.Equal(t, response.Code, http.StatusForbidden, response.Body.String())
+		})
+
+		t.Run("can create credential", func(t *testing.T) {
+			request := &api.UpdateUserRequest{}
+			response := run(t, request, user.ID.String(), adminAccessKey(srv))
+			assert.Equal(t, response.Code, http.StatusOK, response.Body.String())
+
+			var body api.UpdateUserResponse
+			err := json.Unmarshal(response.Body.Bytes(), &body)
+			assert.NilError(t, err)
+
+			assert.Assert(t, body.OneTimePassword != "")
+
+			credential, err := data.GetCredentialByUserID(srv.DB(), user.ID)
+			assert.NilError(t, err)
+
+			assert.Assert(t, credential.OneTimePassword)
+		})
+
+		t.Run("can reset credential to a specific value", func(t *testing.T) {
+			request := &api.UpdateUserRequest{Password: "mysecret"}
+			response := run(t, request, user.ID.String(), adminAccessKey(srv))
+			assert.Equal(t, response.Code, http.StatusOK, response.Body.String())
+
+			var body api.UpdateUserResponse
+			err := json.Unmarshal(response.Body.Bytes(), &body)
+			assert.NilError(t, err)
+
+			assert.Equal(t, body.OneTimePassword, "mysecret")
+
+			credential, err := data.GetCredentialByUserID(srv.DB(), user.ID)
+			assert.NilError(t, err)
+
+			err = bcrypt.CompareHashAndPassword(credential.PasswordHash, []byte(body.OneTimePassword))
+			assert.NilError(t, err)
+		})
+
+		t.Run("can reset credential to a random value", func(t *testing.T) {
+			request := &api.UpdateUserRequest{}
+			response := run(t, request, user.ID.String(), adminAccessKey(srv))
+			assert.Equal(t, response.Code, http.StatusOK, response.Body.String())
+
+			var body api.UpdateUserResponse
+			err := json.Unmarshal(response.Body.Bytes(), &body)
+			assert.NilError(t, err)
+
+			assert.Assert(t, body.OneTimePassword != "")
+
+			credential, err := data.GetCredentialByUserID(srv.DB(), user.ID)
+			assert.NilError(t, err)
+
+			err = bcrypt.CompareHashAndPassword(credential.PasswordHash, []byte(body.OneTimePassword))
+			assert.NilError(t, err)
+		})
+	})
 }
 
 func TestAddUserPublicKey(t *testing.T) {
@@ -967,7 +1186,7 @@ func TestAddUserPublicKey(t *testing.T) {
 		tc.expected(t, resp)
 	}
 
-	var cmpAPIPublicKeyJSON = gocmp.Options{
+	cmpAPIPublicKeyJSON := gocmp.Options{
 		gocmp.FilterPath(pathMapKey(`created`), cmpApproximateTime),
 		gocmp.FilterPath(pathMapKey(`id`), cmpAnyValidUID),
 	}
@@ -1002,12 +1221,14 @@ func TestAddUserPublicKey(t *testing.T) {
 {
 	"id": "<any-valid-uid>",
 	"created": "%[1]v",
+	"expires": "%[2]v",
 	"fingerprint": "SHA256:dwF3R8L454kABUAJc+ZdJeaV2xbcXVJfb81tuv/1KLo",
 	"keyType": "ssh-rsa",
 	"name": "the-name",
 	"publicKey": "AAAAB3NzaC1yc2EAAAADAQABAAABgQDPkW3mIACvMmXqbeGF/U2MY8jbQ5NT24tRL0cl+32vRMmIDGcEyLkWh98D9qJlwCIZ8vJahAI3sqYJRoIHkiaRTslWwAZWNnTJ3TzeKUn/g0xutASD4znmQhNk3OuKPyuDKRxvsOuBVzuKiNNeUWVf5v/4gPrmBffS19cPPlHG+TwHNzTvyvbLcZu+xE18x8eCM4uRam0wa4RfHrMtaqPb/kFGz7skXv0/JFCXKrc//dMKHbr/brjj7fKYFYbMG7k15LewfZ/fLqsbJsvuP8OTIE7195fKhL1Gln8AKOM1E0CLX9nxK7qx4MlrDgEJBbqikWb2kVKmpxwcA7UcoUbwKZb4/QrOUDy22aHnIErIl2is9IP8RfBdKgzmgT1QmVPcGHI4gBAPb279zw58nAVp58gzHvK/oTDlAD2zq87i/PeDSzdoVZe0zliKOXAVzLQGI+9vsZ+6URHBe6J+Tj+PxOD5sWduhepOa/UKF96+CeEg/oso4UHR83z5zR38idc="
 }`,
-					time.Now().Format(time.RFC3339)))
+					time.Now().Format(time.RFC3339),
+					time.Now().UTC().Add(12*time.Hour).Format(time.RFC3339)))
 
 				assert.DeepEqual(t, actual, expected, cmpAPIPublicKeyJSON)
 			},

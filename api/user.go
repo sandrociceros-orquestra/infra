@@ -68,8 +68,12 @@ type UpdateUserRequest struct {
 func (r UpdateUserRequest) ValidationRules() []validate.ValidationRule {
 	return []validate.ValidationRule{
 		validate.Required("id", r.ID),
-		validate.Required("password", r.Password),
 	}
+}
+
+type UpdateUserResponse struct {
+	User
+	OneTimePassword string `json:"oneTimePassword,omitempty"`
 }
 
 func (req ListUsersRequest) SetPage(page int) Paginatable {
@@ -105,4 +109,5 @@ type UserPublicKey struct {
 	KeyType string `json:"keyType"`
 	// Fingerprint is the SHA256 fingerprint of the public key.
 	Fingerprint string `json:"fingerprint" note:"SHA256 fingerprint of the key"`
+	Expires     Time   `json:"expires"`
 }

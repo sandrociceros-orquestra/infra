@@ -1,47 +1,67 @@
 package server
 
 import (
-	"context"
 	"database/sql"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"time"
 
-	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/Masterminds/semver/v3"
 	"github.com/gin-gonic/gin"
 	"gopkg.in/square/go-jose.v2"
 
 	"github.com/infrahq/infra/api"
 	"github.com/infrahq/infra/internal"
 	"github.com/infrahq/infra/internal/access"
-	"github.com/infrahq/infra/internal/logging"
+	"github.com/infrahq/infra/internal/openapi3"
 	"github.com/infrahq/infra/internal/server/authn"
 	"github.com/infrahq/infra/internal/server/data"
 	"github.com/infrahq/infra/internal/server/models"
-	"github.com/infrahq/infra/internal/server/providers"
 	"github.com/infrahq/infra/internal/server/redis"
 )
 
 type API struct {
 	t          *Telemetry
 	server     *Server
-	migrations []apiMigration
-	openAPIDoc openapi3.T
+	openAPIDoc openapi3.Doc
+	versions   map[routeIdentifier][]routeVersion
 }
 
-func (a *API) CreateToken(c *gin.Context, r *api.EmptyRequest) (*api.CreateTokenResponse, error) {
-	rCtx := getRequestContext(c)
+type routeVersion struct {
+	version *semver.Version
+	handler func(c *gin.Context)
+}
 
+func addVersionHandler[Req, Res any](a *API, method, path, version string, routeDef route[Req, Res]) {
+	if a.versions == nil {
+		a.versions = make(map[routeIdentifier][]routeVersion)
+	}
+
+	routeDef.routeSettings.omitFromDocs = true
+
+	key := routeIdentifier{method: method, path: path}
+	a.versions[key] = append(a.versions[key], routeVersion{
+		version: semver.MustParse(version),
+		handler: func(c *gin.Context) {
+			wrapped := wrapRoute(a, key, routeDef)
+			if err := wrapped(c); err != nil {
+				sendAPIError(c.Writer, c.Request, err)
+			}
+		},
+	})
+}
+
+var createTokenRoute = route[api.EmptyRequest, *api.CreateTokenResponse]{
+	routeSettings: routeSettings{idpSync: true},
+	handler:       CreateToken,
+}
+
+func CreateToken(rCtx access.RequestContext, r *api.EmptyRequest) (*api.CreateTokenResponse, error) {
 	if rCtx.Authenticated.User == nil {
 		return nil, fmt.Errorf("no authenticated user")
 	}
-	err := a.UpdateIdentityInfoFromProvider(rCtx)
-	if err != nil {
-		// this will fail if the user was removed from the IDP, which means they no longer are a valid user
-		return nil, fmt.Errorf("%w: failed to update identity info from provider: %s", internal.ErrUnauthorized, err)
-	}
-	token, err := data.CreateIdentityToken(rCtx.DBTxn, rCtx.Authenticated.User.ID)
+	token, err := data.CreateIdentityToken(rCtx.DBTxn, rCtx.Authenticated.Organization, rCtx.Authenticated.User)
 	if err != nil {
 		return nil, err
 	}
@@ -59,14 +79,26 @@ var wellKnownJWKsRoute = route[api.EmptyRequest, WellKnownJWKResponse]{
 	},
 }
 
-func wellKnownJWKsHandler(c *gin.Context, _ *api.EmptyRequest) (WellKnownJWKResponse, error) {
-	rCtx := getRequestContext(c)
-	keys, err := access.GetPublicJWK(rCtx)
+func wellKnownJWKsHandler(rCtx access.RequestContext, _ *api.EmptyRequest) (WellKnownJWKResponse, error) {
+	keys, err := getPublicJWK(rCtx)
 	if err != nil {
 		return WellKnownJWKResponse{}, err
 	}
 
 	return WellKnownJWKResponse{Keys: keys}, nil
+}
+
+func getPublicJWK(rCtx access.RequestContext) ([]jose.JSONWebKey, error) {
+	if rCtx.Authenticated.Organization == nil {
+		return nil, fmt.Errorf("require organization")
+	}
+
+	var pub jose.JSONWebKey
+	if err := pub.UnmarshalJSON(rCtx.Authenticated.Organization.PublicJWK); err != nil {
+		return nil, err
+	}
+
+	return []jose.JSONWebKey{pub}, nil
 }
 
 type WellKnownJWKResponse struct {
@@ -78,9 +110,7 @@ func wrapLinkWithVerification(link, domain, verificationToken string) string {
 	return fmt.Sprintf("https://%s/link?vt=%s&r=%s", domain, verificationToken, link)
 }
 
-func (a *API) Login(c *gin.Context, r *api.LoginRequest) (*api.LoginResponse, error) {
-	rCtx := getRequestContext(c)
-
+func (a *API) Login(rCtx access.RequestContext, r *api.LoginRequest) (*api.LoginResponse, error) {
 	var onSuccess, onFailure func()
 
 	var loginMethod authn.LoginMethod
@@ -123,7 +153,7 @@ func (a *API) Login(c *gin.Context, r *api.LoginRequest) (*api.LoginResponse, er
 			}
 		}
 
-		providerClient, err := a.providerClient(c, provider, r.OIDC.RedirectURL)
+		providerClient, err := a.server.providerClient(rCtx.Request.Context(), provider, r.OIDC.RedirectURL)
 		if err != nil {
 			return nil, fmt.Errorf("login provider client: %w", err)
 		}
@@ -167,25 +197,25 @@ func (a *API) Login(c *gin.Context, r *api.LoginRequest) (*api.LoginResponse, er
 	cookie := cookieConfig{
 		Name:    cookieAuthorizationName,
 		Value:   result.Bearer,
-		Domain:  c.Request.Host,
+		Domain:  rCtx.Request.Host,
 		Expires: result.AccessKey.ExpiresAt,
 	}
-	setCookie(c.Request, c.Writer, cookie)
+	setCookie(rCtx.Request, rCtx.Response.HTTPWriter, cookie)
 
 	key := result.AccessKey
-	a.t.User(key.IssuedFor.String(), result.User.Name)
-	a.t.OrgMembership(key.OrganizationID.String(), key.IssuedFor.String())
-	a.t.Event("login", key.IssuedFor.String(), key.OrganizationID.String(), Properties{
+	a.t.User(key.IssuedForID.String(), result.User.Name)
+	a.t.OrgMembership(key.OrganizationID.String(), key.IssuedForID.String())
+	a.t.Event("login", key.IssuedForID.String(), key.OrganizationID.String(), Properties{
 		"method": loginMethod.Name(),
 		"email":  result.User.Name,
 	})
 
 	// Update the request context so that logging middleware can include the userID
 	rCtx.Authenticated.User = result.User
-	c.Set(access.RequestContextKey, rCtx)
+	rCtx.Response.LoginUserID = result.User.ID
 
 	return &api.LoginResponse{
-		UserID:                 key.IssuedFor,
+		UserID:                 key.IssuedForID,
 		Name:                   key.IssuedForName,
 		AccessKey:              result.Bearer,
 		Expires:                api.Time(key.ExpiresAt),
@@ -194,68 +224,18 @@ func (a *API) Login(c *gin.Context, r *api.LoginRequest) (*api.LoginResponse, er
 	}, nil
 }
 
-func (a *API) Logout(c *gin.Context, _ *api.EmptyRequest) (*api.EmptyResponse, error) {
+func (a *API) Logout(rCtx access.RequestContext, _ *api.EmptyRequest) (*api.EmptyResponse, error) {
 	// does not need authorization check, this action is limited to the calling key
-	rCtx := getRequestContext(c)
 	id := rCtx.Authenticated.AccessKey.ID
 	err := data.DeleteAccessKeys(rCtx.DBTxn, data.DeleteAccessKeysOptions{ByID: id})
 	if err != nil {
 		return nil, err
 	}
 
-	deleteCookie(c.Writer, cookieAuthorizationName, c.Request.Host)
+	deleteCookie(rCtx.Request, rCtx.Response.HTTPWriter, cookieAuthorizationName, rCtx.Request.Host)
 	return nil, nil
 }
 
-func (a *API) Version(c *gin.Context, r *api.EmptyRequest) (*api.Version, error) {
+func (a *API) Version(_ access.RequestContext, _ *api.EmptyRequest) (*api.Version, error) {
 	return &api.Version{Version: internal.FullVersion()}, nil
-}
-
-// UpdateIdentityInfoFromProvider calls the identity provider used to authenticate this user session to update their current information
-func (a *API) UpdateIdentityInfoFromProvider(rCtx access.RequestContext) error {
-	// does not need access check, this action is limited to the calling user
-	identity := rCtx.Authenticated.User
-	if identity == nil {
-		return errors.New("user does not have session with an identity provider")
-	}
-
-	var provider *models.Provider
-	if a.server.Google != nil && rCtx.Authenticated.AccessKey.ProviderID == a.server.Google.ID {
-		provider = a.server.Google
-	} else {
-		var err error
-		provider, err = data.GetProvider(rCtx.DBTxn, data.GetProviderOptions{
-			ByID: rCtx.Authenticated.AccessKey.ProviderID,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to get provider for user info: %w", err)
-		}
-
-		if provider.Kind == models.ProviderKindInfra {
-			// no external verification needed
-			logging.L.Trace().Msg("skipped verifying identity within infra provider, not required")
-			return nil
-		}
-	}
-
-	providerUser, err := data.GetProviderUser(rCtx.DBTxn, rCtx.Authenticated.AccessKey.ProviderID, identity.ID)
-	if err != nil {
-		return fmt.Errorf("failed to get provider user to update: %w", err)
-	}
-
-	oidc, err := a.providerClient(rCtx.Request.Context(), provider, providerUser.RedirectURL)
-	if err != nil {
-		return fmt.Errorf("update provider client: %w", err)
-	}
-
-	return access.UpdateIdentityInfoFromProvider(rCtx, provider, oidc)
-}
-
-func (a *API) providerClient(ctx context.Context, provider *models.Provider, redirectURL string) (providers.OIDCClient, error) {
-	if c := providers.OIDCClientFromContext(ctx); c != nil {
-		// oidc is added to the context during unit tests
-		return c, nil
-	}
-
-	return providers.NewOIDCClient(*provider, string(provider.ClientSecret), redirectURL), nil
 }

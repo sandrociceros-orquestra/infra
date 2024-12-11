@@ -4,6 +4,8 @@ import { useRouter } from 'next/router'
 import { Transition, Dialog } from '@headlessui/react'
 import { Fragment, useState } from 'react'
 
+import { PlusIcon } from '@heroicons/react/24/outline'
+
 import Table from '../../components/table'
 import Dashboard from '../../components/layouts/dashboard'
 
@@ -61,7 +63,7 @@ function AddGroupsDialog({ setOpen }) {
                 value={name}
                 // trim leading whitespace on input. trailing whitespace will be
                 // trimmed on submit
-                onChange={e => setName(e.target.value.trimLeft())}
+                onChange={e => setName(e.target.value.trimStart())}
                 className={`mt-1 block w-full rounded-md shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm ${
                   error ? 'border-red-500' : 'border-gray-300'
                 }`}
@@ -112,7 +114,7 @@ export default function Groups() {
           onClick={() => setOpen(true)}
           className='inline-flex items-center rounded-md border border-transparent bg-black px-4 py-2 text-xs font-medium text-white shadow-sm hover:cursor-pointer hover:bg-gray-800'
         >
-          Add group
+          <PlusIcon className='mr-1 h-3 w-3' /> Group
         </button>
         <Transition.Root show={open} as={Fragment}>
           <Dialog as='div' className='relative z-30' onClose={setOpen}>

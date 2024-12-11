@@ -8,7 +8,8 @@ import (
 	"strings"
 	texttemplate "text/template"
 
-	"github.com/ssoroka/slice"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 
 	"github.com/infrahq/infra/internal"
 	"github.com/infrahq/infra/internal/logging"
@@ -54,7 +55,7 @@ var (
 	SendgridAPIKey     = os.Getenv("SENDGRID_API_KEY")
 	SMTPServer         = "smtp.sendgrid.net:465"
 	TestMode           = false
-	TestDataSent       = []any{}
+	TestData           = []any{}
 	ErrUnknownTemplate = errors.New("unknown template")
 	ErrNotConfigured   = errors.New("email sending not configured")
 )
@@ -111,7 +112,7 @@ func SendTemplate(name, address string, template EmailTemplate, data any, bypass
 		logging.Debugf("sent email to %q: %+v\n", address, data)
 		logging.Debugf("plain: %s", string(msg.PlainBody))
 		logging.Debugf("html: %s", string(msg.HTMLBody))
-		TestDataSent = append(TestDataSent, data)
+		TestData = append(TestData, data)
 		return nil // quietly return
 	}
 
@@ -133,9 +134,8 @@ func SendTemplate(name, address string, template EmailTemplate, data any, bypass
 }
 
 func BuildNameFromEmail(email string) (name string) {
-	name = strings.Join(slice.Map[string, string](strings.Split(strings.Split(email, "@")[0], "."), func(s string) string {
-		return strings.ToUpper(s[0:1]) + s[1:]
-	}), " ")
+	name = strings.Split(strings.Split(email, "@")[0], ".")[0]
+	name = cases.Title(language.Und, cases.NoLower).String(name)
 	if name == "Mail" {
 		name = "Admin"
 	}

@@ -1,13 +1,13 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -19,8 +19,8 @@ import (
 	"github.com/infrahq/infra/internal/server/redis"
 )
 
-func handleInfraDestinationHeader(rCtx access.RequestContext, headers http.Header) error {
-	opts := data.GetDestinationOptions{}
+func handleInfraDestinationHeader(tx *data.Transaction, authned access.Authenticated, headers http.Header) error {
+	opts := data.GetDestinationOptions{FromOrganization: authned.User.OrganizationID}
 	if name := headers.Get(headerInfraDestinationName); name != "" {
 		opts.ByName = name
 	} else if uniqueID := headers.Get(headerInfraDestinationUniqueID); uniqueID != "" {
@@ -29,7 +29,7 @@ func handleInfraDestinationHeader(rCtx access.RequestContext, headers http.Heade
 		return nil // no header
 	}
 
-	destination, err := data.GetDestination(rCtx.DBTxn, opts)
+	destination, err := data.GetDestination(tx, opts)
 	switch {
 	case errors.Is(err, internal.ErrNotFound):
 		return nil // destination does not exist yet
@@ -37,12 +37,16 @@ func handleInfraDestinationHeader(rCtx access.RequestContext, headers http.Heade
 		return err
 	}
 
-	// only save if there's significant difference between LastSeenAt and Now
-	if time.Since(destination.LastSeenAt) > lastSeenUpdateThreshold {
-		destination.LastSeenAt = time.Now()
-		if err := access.UpdateDestination(rCtx, destination); err != nil {
-			return fmt.Errorf("failed to update destination lastSeenAt: %w", err)
-		}
+	rCtx := access.RequestContext{
+		Authenticated: authned,
+		DBTxn:         tx.WithOrgID(authned.User.OrganizationID),
+	}
+	roles := []string{models.InfraConnectorRole, models.InfraAdminRole}
+	if err := access.IsAuthorized(rCtx, roles...); err != nil {
+		return access.HandleAuthErr(err, "destination", "update", roles...)
+	}
+	if err := data.UpdateDestinationLastSeenAt(tx, destination); err != nil {
+		return fmt.Errorf("failed to update destination lastSeenAt: %w", err)
 	}
 	return nil
 }
@@ -105,25 +109,46 @@ func authenticateRequest(c *gin.Context, route routeSettings, srv *Server) (acce
 	}
 
 	if authned.User != nil {
-		tx = tx.WithOrgID(authned.Organization.ID)
-		rCtx := access.RequestContext{DBTxn: tx, Authenticated: authned}
-		if err := handleInfraDestinationHeader(rCtx, c.Request.Header); err != nil {
+		if err := handleInfraDestinationHeader(tx, authned, c.Request.Header); err != nil {
 			return authned, err
 		}
 	}
 
-	err = tx.Commit()
-	return authned, err
-}
+	if err := tx.Commit(); err != nil {
+		return authned, err
+	}
 
-// lastSeenUpdateThreshold is the duration of time that must pass before a
-// LastSeenAt value for a user or destination is updated again. This prevents
-// excessive writes when a single user performs many requests in a short
-// period of time.
-//
-// If you change this value, you may also want to change the threshold in
-// data.ValidateRequestAccessKey.
-const lastSeenUpdateThreshold = 2 * time.Second
+	if authned.User != nil && route.idpSync {
+		if route.authenticationOptional {
+			// this should be caught during development
+			return authned, fmt.Errorf("idp sync requires authentication")
+		}
+		tx, err := srv.db.Begin(c.Request.Context(), nil)
+		if err != nil {
+			return authned, err
+		}
+		defer logError(tx.Rollback, "failed to rollback identity provider sync transaction")
+		tx = tx.WithOrgID(authned.Organization.ID)
+		// sync the identity info here to keep the UI session in sync with IDP session validity
+		if err := srv.syncIdentityInfo(context.Background(), tx, authned.User, authned.AccessKey.ProviderID); err != nil {
+			deleteCookie(c.Request, c.Writer, cookieAuthorizationName, c.Request.Host)
+			if errors.Is(err, ErrSyncFailed) {
+				logging.L.Debug().Err(err)
+			} else {
+				logging.L.Error().Err(err)
+			}
+			if err = tx.Commit(); err != nil {
+				logging.L.Error().Err(err)
+			}
+			return authned, AuthenticationError{Message: "session in identity provider expired or revoked"}
+		}
+		if err = tx.Commit(); err != nil {
+			return authned, err
+		}
+	}
+
+	return authned, nil
+}
 
 // validateOrgMatchesRequest checks that if both the accessKeyOrg and the org
 // from the request are set they have the same ID. If only one is set no
@@ -151,7 +176,7 @@ func validateOrgMatchesRequest(req *http.Request, tx data.ReadTxn, accessKeyOrg 
 }
 
 // requireAccessKey checks the bearer token is present and valid
-func requireAccessKey(c *gin.Context, db *data.Transaction, srv *Server) (access.Authenticated, error) {
+func requireAccessKey(c *gin.Context, db data.WriteTxn, srv *Server) (access.Authenticated, error) {
 	var u access.Authenticated
 
 	bearer, err := reqBearerToken(c, srv.options)
@@ -161,6 +186,9 @@ func requireAccessKey(c *gin.Context, db *data.Transaction, srv *Server) (access
 
 	accessKey, err := data.ValidateRequestAccessKey(db, bearer)
 	if err != nil {
+		if errors.Is(err, data.ErrAccessInactivityTimeout) {
+			return u, AuthenticationError{Message: "access key has expired due to inactivity"}
+		}
 		if errors.Is(err, data.ErrAccessKeyExpired) {
 			return u, AuthenticationError{Message: "access key has expired"}
 		}
@@ -169,7 +197,7 @@ func requireAccessKey(c *gin.Context, db *data.Transaction, srv *Server) (access
 
 	if accessKey.Scopes.Includes(models.ScopePasswordReset) {
 		// PUT /api/users/:id only
-		if c.Request.URL.Path != "/api/users/"+accessKey.IssuedFor.String() || c.Request.Method != http.MethodPut {
+		if c.Request.URL.Path != "/api/users/"+accessKey.IssuedForID.String() || c.Request.Method != http.MethodPut {
 			return u, fmt.Errorf("%w: temporary passwords can only be used to set new passwords", access.ErrNotAuthorized)
 		}
 	}
@@ -179,32 +207,28 @@ func requireAccessKey(c *gin.Context, db *data.Transaction, srv *Server) (access
 		return u, fmt.Errorf("access key org lookup: %w", err)
 	}
 
-	// now that the org is loaded scope all db calls to that org
-	// TODO: set the orgID explicitly in the options passed to GetIdentity to
-	// remove the need for this WithOrgID.
-	db = db.WithOrgID(org.ID)
-
-	// either this access key was issued for a user or for an identity provider to do SCIM
-	if accessKey.IssuedFor == accessKey.ProviderID {
+	// either this access key was issued for a user, connector, or for an identity provider to do SCIM
+	if accessKey.IssuedForKind == models.IssuedForKindProvider {
 		// this access key was issued for SCIM for an identity provider, validate the provider still exists
-		_, err := data.GetProvider(db, data.GetProviderOptions{ByID: accessKey.IssuedFor})
+		_, err := data.GetProvider(db, data.GetProviderOptions{
+			ByID:             accessKey.IssuedForID,
+			FromOrganization: accessKey.OrganizationID,
+		})
 		if err != nil {
 			return u, fmt.Errorf("provider for access key: %w", err)
 		}
 	} else {
 		// the typical case, this is an access key for a user, validate the user still exists
-		identity, err := data.GetIdentity(db, data.GetIdentityOptions{ByID: accessKey.IssuedFor})
+		identity, err := data.GetIdentity(db, data.GetIdentityOptions{
+			ByID:             accessKey.IssuedForID,
+			FromOrganization: accessKey.OrganizationID,
+		})
 		if err != nil {
 			return u, fmt.Errorf("identity for access key: %w", err)
 		}
-
-		if time.Since(identity.LastSeenAt) > lastSeenUpdateThreshold {
-			identity.LastSeenAt = time.Now().UTC()
-			if err = data.UpdateIdentity(db, identity); err != nil {
-				return u, fmt.Errorf("identity update fail: %w", err)
-			}
+		if err = data.UpdateIdentityLastSeenAt(db, identity); err != nil {
+			return u, fmt.Errorf("identity update fail: %w", err)
 		}
-
 		u.User = identity
 	}
 

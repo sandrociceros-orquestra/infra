@@ -14,13 +14,11 @@ import (
 	"time"
 
 	"github.com/Masterminds/semver/v3"
-	"github.com/ssoroka/slice"
 
+	"github.com/infrahq/infra/internal"
 	"github.com/infrahq/infra/internal/logging"
 	"github.com/infrahq/infra/uid"
 )
-
-var apiVersion = "0.18.1"
 
 var (
 	ErrTimeout            = errors.New("client timed out waiting for response from server")
@@ -105,8 +103,8 @@ func (c *Client) buildRequest(
 	req.Header.Add("Authorization", "Bearer "+c.AccessKey)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Infra-Version", apiVersion)
-	req.Header.Set("User-Agent", fmt.Sprintf("Infra/%v (%s %v; %v/%v)", apiVersion, clientName, clientVersion, runtime.GOOS, runtime.GOARCH))
+	req.Header.Set("Infra-Version", internal.FullVersion())
+	req.Header.Set("User-Agent", fmt.Sprintf("Infra/%v (%s %v; %v/%v)", internal.FullVersion(), clientName, clientVersion, runtime.GOOS, runtime.GOARCH))
 
 	for k, v := range c.Headers {
 		req.Header[k] = v
@@ -231,9 +229,11 @@ func delete(ctx context.Context, client Client, path string, query Query) error 
 }
 
 func (c Client) ListUsers(ctx context.Context, req ListUsersRequest) (*ListResponse[User], error) {
-	ids := slice.Map[uid.ID, string](req.IDs, func(id uid.ID) string {
-		return id.String()
-	})
+	ids := make([]string, 0, len(req.IDs))
+	for _, id := range req.IDs {
+		ids = append(ids, id.String())
+	}
+
 	return get[ListResponse[User]](ctx, c, "/api/users", Query{
 		"name":                 {req.Name},
 		"group":                {req.Group.String()},
@@ -257,8 +257,8 @@ func (c Client) CreateUser(ctx context.Context, req *CreateUserRequest) (*Create
 	return post[CreateUserResponse](ctx, c, "/api/users", req)
 }
 
-func (c Client) UpdateUser(ctx context.Context, req *UpdateUserRequest) (*User, error) {
-	return put[User](ctx, c, fmt.Sprintf("/api/users/%s", req.ID.String()), req)
+func (c Client) UpdateUser(ctx context.Context, req *UpdateUserRequest) (*UpdateUserResponse, error) {
+	return put[UpdateUserResponse](ctx, c, fmt.Sprintf("/api/users/%s", req.ID.String()), req)
 }
 
 func (c Client) DeleteUser(ctx context.Context, id uid.ID) error {
@@ -438,14 +438,6 @@ func (c Client) Signup(ctx context.Context, req *SignupRequest) (*SignupResponse
 
 func (c Client) GetServerVersion(ctx context.Context) (*Version, error) {
 	return get[Version](ctx, c, "/api/version", Query{})
-}
-
-func (c Client) GetSettings(ctx context.Context) (*Settings, error) {
-	return get[Settings](ctx, c, "/api/settings", Query{})
-}
-
-func (c Client) UpdateSettings(ctx context.Context, req *Settings) (*Settings, error) {
-	return put[Settings](ctx, c, "/api/settings", req)
 }
 
 func partialText(body []byte, limit int) string {

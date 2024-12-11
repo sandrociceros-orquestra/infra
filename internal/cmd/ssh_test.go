@@ -29,14 +29,17 @@ func TestSSHHostsCmd(t *testing.T) {
 
 	srvDir := t.TempDir()
 	opts := defaultServerOptions(srvDir)
-	opts.Config = server.Config{
+	opts.BootstrapConfig = server.BootstrapConfig{
 		Users: []server.User{
-			{Name: "admin@example.com", AccessKey: "0000000001.adminadminadminadmin1234"},
-			{Name: "anyuser@example.com", AccessKey: "0000000002.notadminsecretnotadmin02"},
-		},
-		Grants: []server.Grant{
-			{User: "admin@example.com", Resource: "infra", Role: "admin"},
-			{User: "anyuser@example.com", Resource: "prodhost", Role: "connect"},
+			{
+				Name:      "admin@example.com",
+				AccessKey: "0000000001.adminadminadminadmin1234",
+				InfraRole: "admin",
+			},
+			{
+				Name:      "anyuser@example.com",
+				AccessKey: "0000000002.notadminsecretnotadmin02",
+			},
 		},
 	}
 	setupServerOptions(t, &opts)
@@ -45,6 +48,9 @@ func TestSSHHostsCmd(t *testing.T) {
 
 	ctx := context.Background()
 	runAndWait(ctx, t, srv.Run)
+
+	createGrants(t, srv.DB(),
+		api.GrantRequest{UserName: "anyuser@example.com", Resource: "prodhost", Privilege: "connect"})
 
 	client, err := NewAPIClient(&APIClientOpts{
 		AccessKey: "0000000001.adminadminadminadmin1234",
@@ -337,7 +343,7 @@ func TestProvisionSSHKey(t *testing.T) {
 
 	srvDir := t.TempDir()
 	opts := defaultServerOptions(srvDir)
-	opts.Config = server.Config{
+	opts.BootstrapConfig = server.BootstrapConfig{
 		Users: []server.User{
 			{Name: "admin@example.com", AccessKey: "0000000001.adminadminadminadmin1234"},
 			{Name: "anyuser@example.com", AccessKey: "0000000002.notadminsecretnotadmin02"},
@@ -497,6 +503,65 @@ func TestProvisionSSHKey(t *testing.T) {
 			},
 		},
 		{
+			name: "keys for wrong server, and delete from API",
+			user: func(t *testing.T) *api.User {
+				existingID, err := uid.Parse([]byte("existing"))
+				assert.NilError(t, err)
+				return &api.User{
+					PublicKeys: []api.UserPublicKey{{ID: existingID}},
+				}
+			},
+			setup: func(t *testing.T, infraSSHDir string) string {
+				keyCfg := &keysConfig{
+					Keys: []localPublicKey{
+						// wrong user
+						{
+							Server:         "infra.example.com",
+							OrganizationID: "if",
+							UserID:         "TTT",
+							PublicKeyID:    "existing",
+						},
+						// keys are deleted from API
+						{
+							Server:         "infra.example.com",
+							OrganizationID: "if",
+							UserID:         user.ID.String(),
+							PublicKeyID:    "something",
+						},
+						{
+							Server:         "infra.example.com",
+							OrganizationID: "if",
+							UserID:         user.ID.String(),
+							PublicKeyID:    "something2",
+						},
+					},
+				}
+				assert.NilError(t, writeKeysConfig(infraSSHDir, keyCfg))
+
+				fs.Apply(t, fs.DirFromPath(t, infraSSHDir),
+					fs.WithDir("keys",
+						fs.WithFile("existing", "private-key"),
+						fs.WithFile("existing.pub", "public-key"),
+						fs.WithFile("something", "private-key"),
+						fs.WithFile("something.pub", "public-key")),
+				)
+
+				return ""
+			},
+			expected: func(t *testing.T, infraSSHDir string, actual, keyFilename string) {
+				keyID := filepath.Base(actual)
+				assert.Assert(t, keyID != "existing")
+
+				user, err := client.GetUserSelf(ctx)
+				assert.NilError(t, err)
+				assert.Equal(t, len(user.PublicKeys), 1)
+
+				actualIDs := keyIDsFromKeysConfig(t, filepath.Join(infraSSHDir, "keys.json"))
+				expectedIDs := []string{"existing", keyID}
+				assert.DeepEqual(t, actualIDs, expectedIDs)
+			},
+		},
+		{
 			name: "local file is missing for key",
 			user: func(t *testing.T) *api.User {
 				existingID, err := uid.Parse([]byte("existing"))
@@ -614,4 +679,55 @@ func keyIDsFromKeysConfig(t *testing.T, filename string) []string {
 		actual = append(actual, key.PublicKeyID)
 	}
 	return actual
+}
+
+func TestMkdirAll(t *testing.T) {
+	tmp := t.TempDir()
+
+	filename := filepath.Join(tmp, "isafile")
+	_, err := os.Create(filename)
+	assert.NilError(t, err)
+	defer os.Remove(filename)
+
+	type testCase struct {
+		name        string
+		path        string
+		expectedErr string
+	}
+
+	run := func(t *testing.T, tc testCase) {
+		err := mkdirAll(tc.path)
+		if tc.expectedErr == "" {
+			assert.NilError(t, err)
+			return
+		}
+		assert.ErrorContains(t, err, tc.expectedErr)
+	}
+
+	testCases := []testCase{
+		{
+			name: "directory does not exist",
+			path: filepath.Join(tmp, "newdir"),
+		},
+		{
+			name: "directory exists",
+			path: tmp,
+		},
+		{
+			name:        "file exists at path",
+			path:        filename,
+			expectedErr: filename + ", the path already exists as a regular file",
+		},
+		{
+			name:        "file exists in parent path",
+			path:        filepath.Join(filename, "newdir"),
+			expectedErr: filename + ", the path already exists as a regular file",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			run(t, tc)
+		})
+	}
 }

@@ -3,16 +3,14 @@ package server
 import (
 	"fmt"
 
-	"github.com/gin-gonic/gin"
-
 	"github.com/infrahq/infra/api"
 	"github.com/infrahq/infra/internal/access"
 	"github.com/infrahq/infra/internal/server/models"
 )
 
-func (a *API) ListOrganizations(c *gin.Context, r *api.ListOrganizationsRequest) (*api.ListResponse[api.Organization], error) {
+func (a *API) ListOrganizations(rCtx access.RequestContext, r *api.ListOrganizationsRequest) (*api.ListResponse[api.Organization], error) {
 	p := PaginationFromRequest(r.PaginationRequest)
-	orgs, err := access.ListOrganizations(c, r.Name, &p)
+	orgs, err := access.ListOrganizations(rCtx, r.Name, &p)
 	if err != nil {
 		return nil, err
 	}
@@ -24,15 +22,15 @@ func (a *API) ListOrganizations(c *gin.Context, r *api.ListOrganizationsRequest)
 	return result, nil
 }
 
-func (a *API) GetOrganization(c *gin.Context, r *api.GetOrganizationRequest) (*api.Organization, error) {
+func (a *API) GetOrganization(rCtx access.RequestContext, r *api.GetOrganizationRequest) (*api.Organization, error) {
 	if r.ID.IsSelf {
-		iden := access.GetRequestContext(c).Authenticated.Organization
+		iden := rCtx.Authenticated.Organization
 		if iden == nil {
 			return nil, fmt.Errorf("no authenticated user")
 		}
 		r.ID.ID = iden.ID
 	}
-	org, err := access.GetOrganization(c, r.ID.ID)
+	org, err := access.GetOrganization(rCtx, r.ID.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -40,19 +38,19 @@ func (a *API) GetOrganization(c *gin.Context, r *api.GetOrganizationRequest) (*a
 	return org.ToAPI(), nil
 }
 
-func (a *API) CreateOrganization(c *gin.Context, r *api.CreateOrganizationRequest) (*api.Organization, error) {
+func (a *API) CreateOrganization(rCtx access.RequestContext, r *api.CreateOrganizationRequest) (*api.Organization, error) {
 	org := &models.Organization{
-		Name:   r.Name,
-		Domain: r.Domain,
+		Name:      r.Name,
+		Domain:    r.Domain,
+		InstallID: rCtx.DataDB.DefaultOrg.InstallID,
 	}
 
-	// TODO: This should be removed in the future in favour of setting CreatedBy automatically
-	authIdent := getRequestContext(c).Authenticated.User
+	authIdent := rCtx.Authenticated.User
 	if authIdent != nil {
 		org.CreatedBy = authIdent.ID
 	}
 
-	err := access.CreateOrganization(c, org)
+	err := access.CreateOrganization(rCtx, org)
 	if err != nil {
 		return nil, err
 	}
@@ -62,6 +60,31 @@ func (a *API) CreateOrganization(c *gin.Context, r *api.CreateOrganizationReques
 	return org.ToAPI(), nil
 }
 
-func (a *API) DeleteOrganization(c *gin.Context, r *api.Resource) (*api.EmptyResponse, error) {
-	return nil, access.DeleteOrganization(c, r.ID)
+func (a *API) DeleteOrganization(rCtx access.RequestContext, r *api.Resource) (*api.EmptyResponse, error) {
+	return nil, access.DeleteOrganization(rCtx, r.ID)
+}
+
+func (a *API) UpdateOrganization(rCtx access.RequestContext, r *api.UpdateOrganizationRequest) (*api.Organization, error) {
+	org, err := access.GetOrganization(rCtx, r.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	// overwrite the existing domains to the incoming ones
+	org.AllowedDomains = []string{}
+	// remove duplicate domains
+	domains := make(map[string]bool)
+	for _, d := range r.AllowedDomains {
+		if !domains[d] {
+			org.AllowedDomains = append(org.AllowedDomains, d)
+		}
+		domains[d] = true
+	}
+
+	err = access.UpdateOrganization(rCtx, org)
+	if err != nil {
+		return nil, err
+	}
+
+	return org.ToAPI(), nil
 }

@@ -6,6 +6,7 @@ on:
       - go.mod
       - go.sum
       - '**/*.go'
+      - 'test/**'
       - '.github/workflows/ci-core.yaml'
       - '.golangci.yml'
 
@@ -16,6 +17,7 @@ on:
       - go.mod
       - go.sum
       - '**/*.go'
+      - 'test/**'
       - '.github/workflows/*-core.yaml'
       - '.golangci.yml'
 
@@ -24,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - uses: actions/setup-go@v3
+      - uses: actions/setup-go@v4
         with:
           go-version: "1.19"
           cache: true
@@ -53,7 +55,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v3
-      - uses: actions/setup-go@v3
+      - uses: actions/setup-go@v4
         with:
           go-version: "1.19"
           cache: true
@@ -93,7 +95,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - uses: actions/setup-go@v3
+      - uses: actions/setup-go@v4
         with:
           go-version: "1.19"
           cache: true
@@ -117,22 +119,28 @@ jobs:
     if: ${{ github.ref_name == 'main' || contains(github.event.pull_request.labels.*.name, 'action/test-acceptance') }}
     steps:
       - uses: actions/checkout@v3
-      - uses: actions/setup-go@v3
+      - uses: actions/setup-go@v4
         with:
           go-version: "1.19"
           cache: true
+      - run: sudo apt-get update && sudo apt-get install -y checkpolicy semodule-utils
       - run: go install gotest.tools/gotestsum@v1.8.2
 
       - name: Filter goreleaser config to linux only
         run: go run ./test/bin/goreleaser-filter.go > .goreleaser.linux.yml
 
-      - uses: goreleaser/goreleaser-action@v3
+      - uses: goreleaser/goreleaser-action@v4
         with:
           distribution: goreleaser
           version: latest
           args: release --rm-dist --snapshot --skip-publish --config .goreleaser.linux.yml
         env:
           RELEASE_NAME: 0.0.0
+
+      # the ./test module uses the main module, this is an easy way to use the
+      # dependencies from the main module
+      - name: Setup workspace
+        run: go work init . ./test
 
       - name: Start containers
         run: |

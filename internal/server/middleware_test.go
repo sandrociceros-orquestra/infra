@@ -30,7 +30,7 @@ func setupDB(t *testing.T) *data.DB {
 	t.Helper()
 	tpatch.ModelsSymmetricKey(t)
 
-	db, err := data.NewDB(data.NewDBOptions{DSN: database.PostgresDriver(t, "_server").DSN})
+	db, err := data.NewDB(data.NewDBOptions{DSN: database.PostgresDriver(t, "server").DSN})
 	assert.NilError(t, err)
 	t.Cleanup(func() {
 		assert.NilError(t, db.Close())
@@ -40,6 +40,10 @@ func setupDB(t *testing.T) *data.DB {
 }
 
 func issueToken(t *testing.T, db data.WriteTxn, identityName string, sessionDuration time.Duration) string {
+	return issueTokenWithTimeout(t, db, identityName, sessionDuration, sessionDuration)
+}
+
+func issueTokenWithTimeout(t *testing.T, db data.WriteTxn, identityName string, sessionDuration, timeout time.Duration) string {
 	user := &models.Identity{Name: identityName}
 
 	err := data.CreateIdentity(db, user)
@@ -48,9 +52,10 @@ func issueToken(t *testing.T, db data.WriteTxn, identityName string, sessionDura
 	provider := data.InfraProvider(db)
 
 	token := &models.AccessKey{
-		IssuedFor:  user.ID,
-		ProviderID: provider.ID,
-		ExpiresAt:  time.Now().Add(sessionDuration).UTC(),
+		IssuedForID:       user.ID,
+		ProviderID:        provider.ID,
+		ExpiresAt:         time.Now().Add(sessionDuration).UTC(),
+		InactivityTimeout: time.Now().Add(timeout).UTC(),
 	}
 	body, err := data.CreateAccessKey(db, token)
 	assert.NilError(t, err)
@@ -80,10 +85,11 @@ func TestRequireAccessKey(t *testing.T) {
 			setup: func(t *testing.T, db data.WriteTxn) *http.Request {
 				provider := data.InfraProvider(db)
 				token := &models.AccessKey{
-					IssuedFor:  provider.ID,
-					ProviderID: provider.ID,
-					Name:       fmt.Sprintf("%s-scim", provider.Name),
-					ExpiresAt:  time.Now().Add(1 * time.Minute).UTC(),
+					IssuedForID:   provider.ID,
+					IssuedForKind: models.IssuedForKindProvider,
+					ProviderID:    provider.ID,
+					Name:          fmt.Sprintf("%s-scim", provider.Name),
+					ExpiresAt:     time.Now().Add(1 * time.Minute).UTC(),
 				}
 				authentication, err := data.CreateAccessKey(db, token)
 				assert.NilError(t, err)
@@ -94,28 +100,6 @@ func TestRequireAccessKey(t *testing.T) {
 			expected: func(t *testing.T, actual access.Authenticated, err error) {
 				assert.NilError(t, err)
 				assert.Assert(t, actual.User == nil)
-			},
-		},
-		"AccessKeyInvalidForProviderNotMatchingIssuedAndProvider": {
-			setup: func(t *testing.T, db data.WriteTxn) *http.Request {
-				provider := data.InfraProvider(db)
-				token := &models.AccessKey{
-					IssuedFor: provider.ID,
-					Name:      fmt.Sprintf("%s-scim", provider.Name),
-					ExpiresAt: time.Now().Add(1 * time.Minute).UTC(),
-				}
-				authentication, err := data.CreateAccessKey(db, token)
-				assert.NilError(t, err)
-				token.ProviderID = 123
-				err = data.UpdateAccessKey(db, token)
-				assert.NilError(t, err)
-
-				r := httptest.NewRequest(http.MethodGet, "/", nil)
-				r.Header.Add("Authorization", "Bearer "+authentication)
-				return r
-			},
-			expected: func(t *testing.T, actual access.Authenticated, err error) {
-				assert.ErrorContains(t, err, "identity for access key: record not found")
 			},
 		},
 		"ValidAuthCookie": {
@@ -209,6 +193,17 @@ func TestRequireAccessKey(t *testing.T) {
 			},
 			expected: func(t *testing.T, _ access.Authenticated, err error) {
 				assert.Error(t, err, "access key has expired")
+			},
+		},
+		"AccessKeyInactivityTimeout": {
+			setup: func(t *testing.T, db data.WriteTxn) *http.Request {
+				authentication := issueTokenWithTimeout(t, db, "existing@infrahq.com", time.Minute*1, time.Minute*-1)
+				r := httptest.NewRequest(http.MethodGet, "/", nil)
+				r.Header.Add("Authorization", "Bearer "+authentication)
+				return r
+			},
+			expected: func(t *testing.T, _ access.Authenticated, err error) {
+				assert.Error(t, err, "access key has expired due to inactivity")
 			},
 		},
 		"AccessKeyInvalidKey": {
@@ -325,8 +320,7 @@ func TestRequireAccessKey(t *testing.T) {
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
 			c.Request = req
 
-			tx := txnForTestCase(t, db, db.DefaultOrg.ID)
-			authned, err := requireAccessKey(c, tx, srv)
+			authned, err := requireAccessKey(c, db, srv)
 			tc.expected(t, authned, err)
 		})
 	}
@@ -342,7 +336,7 @@ func TestHandleInfraDestinationHeader(t *testing.T) {
 	assert.NilError(t, err)
 
 	grant := models.Grant{
-		Subject:   uid.NewIdentityPolymorphicID(connector.ID),
+		Subject:   models.NewSubjectForUser(connector.ID),
 		Privilege: models.InfraConnectorRole,
 		Resource:  "infra",
 	}
@@ -350,9 +344,9 @@ func TestHandleInfraDestinationHeader(t *testing.T) {
 	assert.NilError(t, err)
 
 	token := models.AccessKey{
-		IssuedFor:  connector.ID,
-		ProviderID: data.InfraProvider(db).ID,
-		ExpiresAt:  time.Now().Add(time.Hour).UTC(),
+		IssuedForID: connector.ID,
+		ProviderID:  data.InfraProvider(db).ID,
+		ExpiresAt:   time.Now().Add(time.Hour).UTC(),
 	}
 	secret, err := data.CreateAccessKey(db, &token)
 	assert.NilError(t, err)
@@ -468,10 +462,11 @@ func TestAuthenticateRequest(t *testing.T) {
 	createIdentities(t, tx, user)
 
 	token := &models.AccessKey{
-		IssuedFor:           user.ID,
+		IssuedForID:         user.ID,
 		ProviderID:          data.InfraProvider(tx).ID,
-		ExpiresAt:           time.Now().Add(10 * time.Second),
+		ExpiresAt:           time.Now().Add(time.Minute),
 		InactivityExtension: time.Hour,
+		InactivityTimeout:   time.Now().Add(30 * time.Second),
 		OrganizationMember:  models.OrganizationMember{OrganizationID: org.ID},
 	}
 
@@ -572,9 +567,9 @@ func TestAuthenticateRequest(t *testing.T) {
 				user.LastSeenAt = time.Date(2022, 1, 2, 3, 4, 5, 0, time.UTC)
 				assert.NilError(t, data.UpdateIdentity(tx, &user))
 
-				ak := *token // shallow copy access key
-				ak.InactivityTimeout = time.Now().Add(2 * time.Minute)
-				assert.NilError(t, data.UpdateAccessKey(tx, &ak))
+				_, err = tx.Exec("UPDATE access_keys SET updated_at = ? WHERE id = ?",
+					user.LastSeenAt, token.ID)
+				assert.NilError(t, err)
 
 				assert.NilError(t, tx.Commit())
 
@@ -604,9 +599,9 @@ func TestAuthenticateRequest(t *testing.T) {
 				user.LastSeenAt = now
 				assert.NilError(t, data.UpdateIdentity(tx, &user))
 
-				ak := *token // shallow copy access key
-				ak.InactivityTimeout = now.Add(ak.InactivityExtension)
-				assert.NilError(t, data.UpdateAccessKey(tx, &ak))
+				_, err = tx.Exec("UPDATE access_keys SET updated_at = ?, inactivity_timeout = ? WHERE id = ?",
+					user.LastSeenAt, now.Add(5*time.Minute), token.ID)
+				assert.NilError(t, err)
 
 				assert.NilError(t, tx.Commit())
 
@@ -623,7 +618,7 @@ func TestAuthenticateRequest(t *testing.T) {
 
 				ak, err := data.GetAccessKey(tx, data.GetAccessKeysOptions{ByID: token.ID})
 				assert.NilError(t, err)
-				assert.Equal(t, ak.InactivityTimeout, now.Add(token.InactivityExtension),
+				assert.Equal(t, ak.InactivityTimeout, now.Add(5*time.Minute),
 					"expected no update")
 			},
 		},
@@ -670,7 +665,7 @@ func TestValidateRequestOrganization(t *testing.T) {
 	createIdentities(t, tx, user)
 
 	token := &models.AccessKey{
-		IssuedFor:          user.ID,
+		IssuedForID:        user.ID,
 		ProviderID:         data.InfraProvider(tx).ID,
 		ExpiresAt:          time.Now().Add(10 * time.Second),
 		OrganizationMember: models.OrganizationMember{OrganizationID: org.ID},

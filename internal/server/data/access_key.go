@@ -3,13 +3,12 @@ package data
 import (
 	"crypto/sha256"
 	"crypto/subtle"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/infrahq/infra/internal"
 	"github.com/infrahq/infra/internal/generate"
+	"github.com/infrahq/infra/internal/logging"
 	"github.com/infrahq/infra/internal/server/data/querybuilder"
 	"github.com/infrahq/infra/internal/server/models"
 	"github.com/infrahq/infra/uid"
@@ -22,15 +21,15 @@ func (a accessKeyTable) Table() string {
 }
 
 func (a accessKeyTable) Columns() []string {
-	return []string{"created_at", "deleted_at", "expires_at", "inactivity_extension", "inactivity_timeout", "id", "issued_for", "key_id", "name", "organization_id", "provider_id", "scopes", "secret_checksum", "updated_at"}
+	return []string{"created_at", "deleted_at", "expires_at", "inactivity_extension", "inactivity_timeout", "id", "issued_for_id", "issued_for_kind", "key_id", "name", "organization_id", "provider_id", "scopes", "secret_checksum", "updated_at"}
 }
 
 func (a accessKeyTable) Values() []any {
-	return []any{a.CreatedAt, a.DeletedAt, a.ExpiresAt, a.InactivityExtension, a.InactivityTimeout, a.ID, a.IssuedFor, a.KeyID, a.Name, a.OrganizationID, a.ProviderID, a.Scopes, a.SecretChecksum, a.UpdatedAt}
+	return []any{a.CreatedAt, a.DeletedAt, a.ExpiresAt, a.InactivityExtension, a.InactivityTimeout, a.ID, a.IssuedForID, a.IssuedForKind, a.KeyID, a.Name, a.OrganizationID, a.ProviderID, a.Scopes, a.SecretChecksum, a.UpdatedAt}
 }
 
 func (a *accessKeyTable) ScanFields() []any {
-	return []any{&a.CreatedAt, &a.DeletedAt, &a.ExpiresAt, &a.InactivityExtension, &a.InactivityTimeout, &a.ID, &a.IssuedFor, &a.KeyID, &a.Name, &a.OrganizationID, &a.ProviderID, &a.Scopes, &a.SecretChecksum, &a.UpdatedAt}
+	return []any{&a.CreatedAt, &a.DeletedAt, &a.ExpiresAt, &a.InactivityExtension, &a.InactivityTimeout, &a.ID, &a.IssuedForID, &a.IssuedForKind, &a.KeyID, &a.Name, &a.OrganizationID, &a.ProviderID, &a.Scopes, &a.SecretChecksum, &a.UpdatedAt}
 }
 
 var (
@@ -45,7 +44,7 @@ func secretChecksum(secret string) []byte {
 
 func validateAccessKey(accessKey *models.AccessKey) error {
 	switch {
-	case accessKey.IssuedFor == 0:
+	case accessKey.IssuedForID == 0:
 		return fmt.Errorf("issuedFor is required")
 	case accessKey.ProviderID == 0:
 		return fmt.Errorf("providerID is required")
@@ -56,17 +55,6 @@ func validateAccessKey(accessKey *models.AccessKey) error {
 }
 
 func CreateAccessKey(db WriteTxn, accessKey *models.AccessKey) (body string, err error) {
-	// check if this is an access key being issued for identity provider scim
-	provider, err := GetProvider(db, GetProviderOptions{ByID: accessKey.IssuedFor})
-	if err != nil && !errors.Is(err, internal.ErrNotFound) {
-		return "", fmt.Errorf("check create scim key: %w", err)
-	}
-	if provider != nil {
-		// set the access key provider to match the provider it was issued for
-		// this is used in key validation to detect keys issued for scim
-		accessKey.ProviderID = provider.ID
-	}
-
 	if accessKey.ProviderID == 0 {
 		accessKey.ProviderID = InfraProvider(db).ID
 	}
@@ -93,17 +81,28 @@ func CreateAccessKey(db WriteTxn, accessKey *models.AccessKey) (body string, err
 		accessKey.ExpiresAt = time.Now().Add(time.Hour * 12).UTC()
 	}
 
-	if accessKey.Name == "" {
-		// set a default name for look-up and CLI usage
-		if accessKey.ID == 0 {
-			accessKey.ID = uid.New()
-		}
-
-		identityIssuedFor, err := GetIdentity(db, GetIdentityOptions{ByID: accessKey.IssuedFor})
+	if accessKey.IssuedForKind != models.IssuedForKindProvider {
+		identityIssuedFor, err := GetIdentity(db, GetIdentityOptions{ByID: accessKey.IssuedForID})
 		if err != nil {
 			return "", fmt.Errorf("key name from identity: %w", err)
 		}
 
+		accessKey.IssuedForKind = models.IssuedForKindUser
+		if identityIssuedFor.Name == models.InternalInfraConnectorIdentityName {
+			accessKey.IssuedForKind = models.IssuedForKindOrganization
+		}
+	}
+
+	if accessKey.Name == "" {
+		identityIssuedFor, err := GetIdentity(db, GetIdentityOptions{ByID: accessKey.IssuedForID})
+		if err != nil {
+			return "", fmt.Errorf("key name from identity: %w", err)
+		}
+
+		// set a default name for look-up and CLI usage
+		if accessKey.ID == 0 {
+			accessKey.ID = uid.New()
+		}
 		accessKey.Name = fmt.Sprintf("%s-%s", identityIssuedFor.Name, accessKey.ID.String())
 	}
 
@@ -145,7 +144,7 @@ func ListAccessKeys(tx ReadTxn, opts ListAccessKeyOptions) ([]models.AccessKey, 
 		query.B(", count(*) OVER()")
 	}
 	query.B("FROM access_keys INNER JOIN identities")
-	query.B("ON access_keys.issued_for = identities.id")
+	query.B("ON access_keys.issued_for_id = identities.id")
 	query.B("WHERE access_keys.deleted_at is null AND identities.deleted_at is null")
 	query.B("AND access_keys.organization_id = ?", tx.OrganizationID())
 
@@ -156,7 +155,7 @@ func ListAccessKeys(tx ReadTxn, opts ListAccessKeyOptions) ([]models.AccessKey, 
 		query.B("AND (inactivity_timeout > ? OR inactivity_timeout = ? OR inactivity_timeout is null)", now, zero)
 	}
 	if opts.ByIssuedForID != 0 {
-		query.B("AND issued_for = ?", opts.ByIssuedForID)
+		query.B("AND issued_for_id = ?", opts.ByIssuedForID)
 	}
 	if opts.ByName != "" {
 		query.B("AND access_keys.name = ?", opts.ByName)
@@ -203,9 +202,9 @@ func GetAccessKeyByKeyID(tx ReadTxn, keyID string) (*models.AccessKey, error) {
 }
 
 type GetAccessKeysOptions struct {
-	ByID      uid.ID
-	ByName    string
-	IssuedFor uid.ID
+	ByID        uid.ID
+	ByName      string
+	IssuedForID uid.ID
 }
 
 // GetAccessKey by any unique field. This must be scoped by organizationID as it's callable by users.
@@ -215,18 +214,18 @@ func GetAccessKey(tx ReadTxn, opts GetAccessKeysOptions) (*models.AccessKey, err
 	query.B(columnsForSelect(accessKey))
 	query.B(", identities.name")
 	query.B("FROM access_keys INNER JOIN identities")
-	query.B("ON access_keys.issued_for = identities.id")
+	query.B("ON access_keys.issued_for_id = identities.id")
 	query.B("WHERE access_keys.deleted_at is null")
 	query.B("AND access_keys.organization_id = ?", tx.OrganizationID())
 
 	switch {
 	case opts.ByID != 0:
 		query.B("AND access_keys.id = ?", opts.ByID)
-	case opts.ByName != "" && opts.IssuedFor != 0:
+	case opts.ByName != "" && opts.IssuedForID != 0:
 		query.B("AND access_keys.name = ?", opts.ByName)
-		query.B("AND access_keys.issued_for = ?", opts.IssuedFor)
+		query.B("AND access_keys.issued_for_id = ?", opts.IssuedForID)
 	default:
-		return nil, fmt.Errorf("either an ID, or name and issued_for are required")
+		return nil, fmt.Errorf("either an ID, or name and issued_for_id are required")
 	}
 
 	fields := append(accessKey.ScanFields(), &accessKey.IssuedForName)
@@ -240,7 +239,7 @@ func GetAccessKey(tx ReadTxn, opts GetAccessKeysOptions) (*models.AccessKey, err
 type DeleteAccessKeysOptions struct {
 	// ByID instructs DeleteAccessKeys to delete the key with this ID.
 	ByID uid.ID
-	// ByIssuedForID instructs DeleteAccessKeys to delete keys issued for this user.
+	// ByIssuedForID instructs DeleteAccessKeys to delete keys issued for this id.
 	ByIssuedForID uid.ID
 	// ByProviderID instructs DeleteAccessKeys to delete keys issued by this
 	// provider.
@@ -259,7 +258,7 @@ func DeleteAccessKeys(tx WriteTxn, opts DeleteAccessKeysOptions) error {
 		query.B("AND id = ?", opts.ByID)
 	}
 	if opts.ByIssuedForID != 0 {
-		query.B("AND issued_for = ?", opts.ByIssuedForID)
+		query.B("AND issued_for_id = ?", opts.ByIssuedForID)
 	}
 	if opts.ByProviderID != 0 {
 		query.B("AND provider_id = ?", opts.ByProviderID)
@@ -270,7 +269,7 @@ func DeleteAccessKeys(tx WriteTxn, opts DeleteAccessKeysOptions) error {
 }
 
 // TODO: move this to access package?
-func ValidateRequestAccessKey(tx *Transaction, authnKey string) (*models.AccessKey, error) {
+func ValidateRequestAccessKey(tx WriteTxn, authnKey string) (*models.AccessKey, error) {
 	keyID, secret, ok := strings.Cut(authnKey, ".")
 	if !ok {
 		return nil, fmt.Errorf("invalid access key format")
@@ -280,10 +279,8 @@ func ValidateRequestAccessKey(tx *Transaction, authnKey string) (*models.AccessK
 	if err != nil {
 		return nil, fmt.Errorf("%w: could not get access key from database, it may not exist", err)
 	}
-	tx = tx.WithOrgID(t.OrganizationID)
 
 	sum := secretChecksum(secret)
-
 	if subtle.ConstantTimeCompare(t.SecretChecksum, sum) != 1 {
 		return nil, fmt.Errorf("access key invalid secret")
 	}
@@ -297,19 +294,47 @@ func ValidateRequestAccessKey(tx *Transaction, authnKey string) (*models.AccessK
 		if now.After(t.InactivityTimeout) {
 			return nil, ErrAccessInactivityTimeout
 		}
-
-		origTimeout := t.InactivityTimeout
 		t.InactivityTimeout = now.Add(t.InactivityExtension)
-		// Throttle updates when the key is used frequently. Uses the
-		// same value as server.lastSeenUpdateThreshold.
-		if t.InactivityTimeout.Sub(origTimeout) > 2*time.Second {
-			if err := UpdateAccessKey(tx, t); err != nil {
-				return nil, err
-			}
-		}
 	}
 
-	return t, nil
+	err = updateAccessKeyOnUse(tx, t)
+	return t, err
+}
+
+// lastSeenUpdateThreshold is the duration of time that must pass before a
+// LastSeenAt value for a user, access key, or destination is updated again.
+// This prevents excessive writes when a single user performs many requests
+// in a short period of time.
+const lastSeenUpdateThreshold = 2 * time.Second
+
+// updateAccessKeyOnUse sets key.UpdatedAt to now and then updates the
+// user row in the database to match the specified key. Updates are throttled to once every 2 seconds.
+// If the access key was updated recently, or the database row is already locked, the
+// update will be skipped.
+//
+// Unlike most functions in this package, this function uses key.OrganizationID
+// not tx.OrganizationID.
+func updateAccessKeyOnUse(tx WriteTxn, key *models.AccessKey) error {
+	if time.Since(key.UpdatedAt) < lastSeenUpdateThreshold {
+		return nil
+	}
+
+	origUpdatedAt := key.UpdatedAt
+	if err := key.OnUpdate(); err != nil {
+		return err
+	}
+
+	table := (*accessKeyTable)(key)
+	query := querybuilder.New("UPDATE access_keys SET")
+	query.B(columnsForUpdate(table), table.Values()...)
+	query.B("WHERE deleted_at is null")
+	query.B("AND organization_id = ?", key.OrganizationID)
+	// only update if the row has not changed since the SELECT
+	query.B("AND updated_at = ?", origUpdatedAt)
+	query.B("AND id IN (SELECT id from access_keys WHERE id = ? FOR UPDATE SKIP LOCKED)", table.Primary())
+
+	_, err := tx.Exec(query.String(), query.Args...)
+	return handleError(err)
 }
 
 func RemoveExpiredAccessKeys(tx WriteTxn) error {
@@ -318,6 +343,16 @@ func RemoveExpiredAccessKeys(tx WriteTxn) error {
 	query.B("WHERE deleted_at is null")
 	query.B("AND expires_at <= ?", time.Now().UTC().Add(-1*time.Hour)) // leave buffer so keys aren't immediately deleted on expiry.
 
-	_, err := tx.Exec(query.String(), query.Args...)
+	result, err := tx.Exec(query.String(), query.Args...)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count > 0 {
+		logging.L.Info().Int64("count", count).Msg("removed expired access keys")
+	}
 	return err
 }

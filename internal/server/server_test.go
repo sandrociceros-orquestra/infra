@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -14,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/infrahq/secrets"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog"
 	"gotest.tools/v3/assert"
@@ -22,8 +20,12 @@ import (
 	"gotest.tools/v3/golden"
 
 	"github.com/infrahq/infra/api"
+	"github.com/infrahq/infra/internal"
 	"github.com/infrahq/infra/internal/cmd/types"
 	"github.com/infrahq/infra/internal/logging"
+	"github.com/infrahq/infra/internal/server/data"
+	"github.com/infrahq/infra/internal/server/models"
+	"github.com/infrahq/infra/internal/server/providers"
 	"github.com/infrahq/infra/internal/testing/database"
 )
 
@@ -45,11 +47,7 @@ func setupServer(t *testing.T, ops ...func(*testing.T, *Options)) *Server {
 	s := newServer(options)
 	s.db = setupDB(t)
 
-	// TODO: share more of this with Server.New
-	err := loadDefaultSecretConfig(s.secrets)
-	assert.NilError(t, err)
-
-	err = s.loadConfig(s.options.Config)
+	err := s.loadConfig(s.options.BootstrapConfig)
 	assert.NilError(t, err)
 
 	s.metricsRegistry = prometheus.NewRegistry()
@@ -59,46 +57,43 @@ func setupServer(t *testing.T, ops ...func(*testing.T, *Options)) *Server {
 func TestGetPostgresConnectionURL(t *testing.T) {
 	logging.PatchLogger(t, zerolog.NewTestWriter(t))
 
-	storage := map[string]secrets.SecretStorage{
-		"plaintext": secrets.NewPlainSecretProviderFromConfig(secrets.GenericConfig{}),
-	}
 	options := Options{}
 
-	url, err := getPostgresConnectionString(options, storage)
+	url, err := getPostgresConnectionString(options)
 	assert.NilError(t, err)
 	assert.Assert(t, is.Len(url, 0))
 
 	options.DBHost = "localhost"
-	url, err = getPostgresConnectionString(options, storage)
+	url, err = getPostgresConnectionString(options)
 	assert.NilError(t, err)
 	assert.Equal(t, "host=localhost", url)
 
 	options.DBPort = 5432
-	url, err = getPostgresConnectionString(options, storage)
+	url, err = getPostgresConnectionString(options)
 	assert.NilError(t, err)
 	assert.Equal(t, "host=localhost port=5432", url)
 
 	options.DBUsername = "user"
-	url, err = getPostgresConnectionString(options, storage)
+	url, err = getPostgresConnectionString(options)
 	assert.NilError(t, err)
 	assert.Equal(t, "host=localhost user=user port=5432", url)
 
-	options.DBPassword = "plaintext:secret"
-	url, err = getPostgresConnectionString(options, storage)
+	options.DBPassword = "secret"
+	url, err = getPostgresConnectionString(options)
 	assert.NilError(t, err)
 	assert.Equal(t, "host=localhost user=user password=secret port=5432", url)
 
 	options.DBName = "postgres"
-	url, err = getPostgresConnectionString(options, storage)
+	url, err = getPostgresConnectionString(options)
 	assert.NilError(t, err)
 	assert.Equal(t, "host=localhost user=user password=secret port=5432 dbname=postgres", url)
 
 	t.Run("connection string with password from secrets", func(t *testing.T) {
 		options := Options{
 			DBConnectionString: "host=localhost user=user port=5432",
-			DBPassword:         "plaintext:foo",
+			DBPassword:         "foo",
 		}
-		dsn, err := getPostgresConnectionString(options, storage)
+		dsn, err := getPostgresConnectionString(options)
 		assert.NilError(t, err)
 		assert.Equal(t, "host=localhost user=user port=5432 password=foo", dsn)
 	})
@@ -113,17 +108,16 @@ func TestServer_Run(t *testing.T) {
 
 	dir := t.TempDir()
 	opts := Options{
-		DBEncryptionKeyProvider: "native",
-		DBEncryptionKey:         filepath.Join(dir, "sqlite3.db.key"),
-		TLSCache:                filepath.Join(dir, "tlscache"),
+		DBEncryptionKey: filepath.Join(dir, "root.key"),
+		TLSCache:        filepath.Join(dir, "tlscache"),
 		TLS: TLSOptions{
 			CA:           types.StringOrFile(golden.Get(t, "pki/ca.crt")),
-			CAPrivateKey: string(golden.Get(t, "pki/ca.key")),
+			CAPrivateKey: types.StringOrFile(golden.Get(t, "pki/ca.key")),
 		},
 		API: APIOptions{RequestTimeout: time.Minute},
 	}
 
-	driver := database.PostgresDriver(t, "_server_run")
+	driver := database.PostgresDriver(t, "server")
 	opts.DBConnectionString = driver.DSN
 
 	srv, err := New(opts)
@@ -156,7 +150,7 @@ func TestServer_Run(t *testing.T) {
 		defer resp.Body.Close()
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
 
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		assert.NilError(t, err)
 		// the infra http request metric
 		assert.Assert(t, is.Contains(string(body), "# HELP http_request_duration_seconds"))
@@ -210,20 +204,19 @@ func TestServer_Run_UIProxy(t *testing.T) {
 
 	dir := t.TempDir()
 	opts := Options{
-		DBEncryptionKeyProvider: "native",
-		DBEncryptionKey:         filepath.Join(dir, "sqlite3.db.key"),
-		TLSCache:                filepath.Join(dir, "tlscache"),
-		EnableSignup:            true,
-		BaseDomain:              "example.com",
+		DBEncryptionKey: filepath.Join(dir, "root.key"),
+		TLSCache:        filepath.Join(dir, "tlscache"),
+		EnableSignup:    true,
+		BaseDomain:      "example.com",
 		TLS: TLSOptions{
 			CA:           types.StringOrFile(golden.Get(t, "pki/ca.crt")),
-			CAPrivateKey: string(golden.Get(t, "pki/ca.key")),
+			CAPrivateKey: types.StringOrFile(golden.Get(t, "pki/ca.key")),
 		},
 		API: APIOptions{RequestTimeout: time.Minute},
 	}
 	assert.NilError(t, opts.UI.ProxyURL.Set(uiSrv.URL))
 
-	driver := database.PostgresDriver(t, "_server_run")
+	driver := database.PostgresDriver(t, "server")
 	opts.DBConnectionString = driver.DSN
 
 	srv, err := New(opts)
@@ -242,7 +235,7 @@ func TestServer_Run_UIProxy(t *testing.T) {
 		defer resp.Body.Close()
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
 
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		assert.NilError(t, err)
 		assert.Equal(t, message, string(body))
 	})
@@ -284,7 +277,7 @@ func TestServer_GenerateRoutes_NoRoute(t *testing.T) {
 
 	run := func(t *testing.T, tc testCase) {
 		u := httpSrv.URL + tc.path
-		req, err := http.NewRequest(http.MethodGet, u, nil)
+		req, err := http.NewRequestWithContext(context.TODO(), http.MethodGet, u, nil)
 		assert.NilError(t, err)
 
 		if tc.setup != nil {
@@ -411,9 +404,139 @@ func TestServer_PersistSignupUser(t *testing.T) {
 	checkAuthenticated()
 
 	// reload server config
-	err = s.loadConfig(s.options.Config)
+	err = s.loadConfig(s.options.BootstrapConfig)
 	assert.NilError(t, err)
 
 	// retry the authenticated endpoint
 	checkAuthenticated()
+}
+
+func TestSyncIdentityInfo(t *testing.T) {
+	srv := setupServer(t)
+	db := txnForTestCase(t, srv.db, srv.db.DefaultOrg.ID)
+	infraProvider := data.InfraProvider(srv.DB())
+
+	identity := &models.Identity{Name: "user-to-sync"}
+	assert.NilError(t, data.CreateIdentity(srv.DB(), identity))
+
+	provider := &models.Provider{
+		Name:         "mockta",
+		URL:          "example.com",
+		ClientID:     "aaa",
+		ClientSecret: "bbb",
+		Kind:         models.ProviderKindOIDC,
+	}
+
+	assert.NilError(t, data.CreateProvider(db, provider))
+
+	google := &models.Provider{
+		Model: models.Model{
+			ID: models.InternalGoogleProviderID,
+		},
+		Name:         "moogle",
+		URL:          "moogle.example.com",
+		ClientID:     "aaa",
+		ClientSecret: "bbb",
+		Kind:         models.ProviderKindGoogle,
+	}
+	srv.Google = google
+
+	t.Run("a revoked OIDC session revokes access keys created by provider login", func(t *testing.T) {
+		user, err := data.CreateProviderUser(db, provider, identity)
+		assert.NilError(t, err)
+		// need to directly update set lastUpdate to the past, provider user functions explicitly set lastUpdate to now
+		stmt := `
+			UPDATE provider_users
+			SET last_update = ?
+			WHERE provider_id = ? AND identity_id = ?
+		`
+		_, err = db.Exec(stmt, time.Now().UTC().Add(-121*time.Minute), user.ProviderID, user.IdentityID)
+		assert.NilError(t, err)
+		ctx := providers.WithOIDCClient(context.Background(), &fakeOIDCImplementation{UserInfoRevoked: true})
+
+		toBeRevoked := &models.AccessKey{
+			IssuedForID: identity.ID,
+			ProviderID:  provider.ID,
+		}
+		_, err = data.CreateAccessKey(db, toBeRevoked)
+		assert.NilError(t, err)
+		shouldStayValid := &models.AccessKey{
+			IssuedForID: identity.ID,
+			ProviderID:  infraProvider.ID,
+		}
+		_, err = data.CreateAccessKey(db, shouldStayValid)
+		assert.NilError(t, err)
+
+		err = srv.syncIdentityInfo(ctx, db, identity, provider.ID)
+		assert.ErrorContains(t, err, "user revoked")
+
+		_, err = data.GetAccessKeyByKeyID(db, toBeRevoked.KeyID)
+		assert.ErrorIs(t, err, internal.ErrNotFound)
+
+		_, err = data.GetAccessKeyByKeyID(db, shouldStayValid.KeyID)
+		assert.NilError(t, err)
+	})
+
+	t.Run("a revoked OIDC session revokes access keys created by social login", func(t *testing.T) {
+		user, err := data.CreateProviderUser(db, google, identity)
+		assert.NilError(t, err)
+		// need to directly update set lastUpdate to the past, provider user functions explicitly set lastUpdate to now
+		stmt := `
+			UPDATE provider_users
+			SET last_update = ?
+			WHERE provider_id = ? AND identity_id = ?
+		`
+		_, err = db.Exec(stmt, time.Now().UTC().Add(-121*time.Minute), user.ProviderID, user.IdentityID)
+		assert.NilError(t, err)
+		ctx := providers.WithOIDCClient(context.Background(), &fakeOIDCImplementation{UserInfoRevoked: true})
+
+		toBeRevoked := &models.AccessKey{
+			IssuedForID: identity.ID,
+			ProviderID:  google.ID,
+		}
+		_, err = data.CreateAccessKey(db, toBeRevoked)
+		assert.NilError(t, err)
+		shouldStayValid := &models.AccessKey{
+			IssuedForID: identity.ID,
+			ProviderID:  infraProvider.ID,
+		}
+		_, err = data.CreateAccessKey(db, shouldStayValid)
+		assert.NilError(t, err)
+
+		err = srv.syncIdentityInfo(ctx, db, identity, google.ID)
+		assert.ErrorContains(t, err, "user revoked")
+
+		_, err = data.GetAccessKeyByKeyID(db, toBeRevoked.KeyID)
+		assert.ErrorIs(t, err, internal.ErrNotFound)
+
+		_, err = data.GetAccessKeyByKeyID(db, shouldStayValid.KeyID)
+		assert.NilError(t, err)
+	})
+
+	t.Run("a valid OIDC session does not result in an error", func(t *testing.T) {
+		user, err := data.CreateProviderUser(db, provider, identity)
+		assert.NilError(t, err)
+		// need to directly update set lastUpdate to the past, provider user functions explicitly set lastUpdate to now
+		stmt := `
+			UPDATE provider_users
+			SET last_update = ?
+			WHERE provider_id = ? AND identity_id = ?
+		`
+		_, err = db.Exec(stmt, time.Now().UTC().Add(-121*time.Minute), user.ProviderID, user.IdentityID)
+		assert.NilError(t, err)
+		ctx := providers.WithOIDCClient(context.Background(), &fakeOIDCImplementation{})
+
+		key := &models.AccessKey{
+			IssuedForID: identity.ID,
+			ProviderID:  provider.ID,
+		}
+		_, err = data.CreateAccessKey(db, key)
+		assert.NilError(t, err)
+
+		err = srv.syncIdentityInfo(ctx, db, identity, provider.ID)
+		assert.NilError(t, err)
+
+		_, err = data.GetAccessKeyByKeyID(db, key.KeyID)
+		assert.NilError(t, err)
+	})
 }

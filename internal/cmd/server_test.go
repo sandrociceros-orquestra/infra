@@ -124,18 +124,12 @@ func TestServerCmd_LoadOptions(t *testing.T) {
 			name: "env vars with config file",
 			setup: func(t *testing.T, cmd *cobra.Command) {
 				content := `
-grants:
-  - user: user1
-    resource: infra
-    role: admin
-  - user: user2
-    resource: infra
-    role: admin
 
 users:
   - name: username
     accessKey: access-key
     password: the-password
+    infraRole: admin
 `
 				dir := fs.NewDir(t, t.Name(),
 					fs.WithFile("cfg.yaml", content))
@@ -152,12 +146,13 @@ users:
 				expected.TLS.CAPrivateKey = "file:foo/ca.key"
 				expected.DBConnectionString = "host=db port=5432 user=postgres dbname=postgres password=postgres"
 				expected.DBEncryptionKey = "/root.key"
-				expected.Config.Users = []server.User{
-					{Name: "username", AccessKey: "access-key", Password: "the-password"},
-				}
-				expected.Config.Grants = []server.Grant{
-					{User: "user1", Resource: "infra", Role: "admin"},
-					{User: "user2", Resource: "infra", Role: "admin"},
+				expected.BootstrapConfig.Users = []server.User{
+					{
+						Name:      "username",
+						AccessKey: "access-key",
+						Password:  "the-password",
+						InfraRole: "admin",
+					},
 				}
 				return expected
 			},
@@ -175,7 +170,6 @@ sessionDuration: 3m
 sessionInactivityTimeout: 1m
 
 dbEncryptionKey: /this-is-the-path
-dbEncryptionKeyProvider: the-provider
 dbHost: the-host
 dbPort: 5432
 dbName: infradbname
@@ -195,18 +189,6 @@ tls:
   privateKey: file:server.key
   ACME: true
 
-keys:
-  - kind: vault
-    config:
-      token: the-token
-      address: 10.1.1.1:1234
-
-secrets:
-  - kind: env
-    name: base64env
-    config:
-      base64: true
-
 addr:
   http: "1.2.3.4:23"
   https: "1.2.3.5:433"
@@ -216,24 +198,11 @@ ui:
   enabled: false # default is true
   proxyURL: "1.2.3.4:5151"
 
-providers:
-  - name: okta
-    url: https://dev-okta.com/
-    clientID: client-id
-    clientSecret: the-secret
-
-grants:
-  - user: user1
-    resource: infra
-    role: admin
-  - group: group1
-    resource: production
-    role: special
-
 users:
   - name: username
     accessKey: access-key
     password: the-password
+    infraRole: admin
 
 redis:
   host: myredis
@@ -257,14 +226,13 @@ api:
 					SessionDuration:          3 * time.Minute,
 					SessionInactivityTimeout: 1 * time.Minute,
 
-					DBEncryptionKey:         "/this-is-the-path",
-					DBEncryptionKeyProvider: "the-provider",
-					DBHost:                  "the-host",
-					DBPort:                  5432,
-					DBParameters:            "sslmode=require",
-					DBPassword:              "env:POSTGRES_DB_PASSWORD",
-					DBUsername:              "infra",
-					DBName:                  "infradbname",
+					DBEncryptionKey: "/this-is-the-path",
+					DBHost:          "the-host",
+					DBPort:          5432,
+					DBParameters:    "sslmode=require",
+					DBPassword:      "env:POSTGRES_DB_PASSWORD",
+					DBUsername:      "infra",
+					DBName:          "infradbname",
 
 					BaseDomain:         "foo.example.com",
 					LoginDomainPrefix:  "login",
@@ -292,50 +260,13 @@ api:
 						ACME:         true,
 					},
 
-					Keys: []server.KeyProvider{
-						{
-							Kind: "vault",
-							Config: server.VaultConfig{
-								Token:   "the-token",
-								Address: "10.1.1.1:1234",
-							},
-						},
-					},
-
-					Secrets: []server.SecretProvider{
-						{
-							Kind:   "env",
-							Name:   "base64env",
-							Config: server.GenericConfig{Base64: true},
-						},
-					},
-
-					Config: server.Config{
-						Providers: []server.Provider{
-							{
-								Name:         "okta",
-								URL:          "https://dev-okta.com/",
-								ClientID:     "client-id",
-								ClientSecret: "the-secret",
-							},
-						},
-						Grants: []server.Grant{
-							{
-								User:     "user1",
-								Resource: "infra",
-								Role:     "admin",
-							},
-							{
-								Group:    "group1",
-								Resource: "production",
-								Role:     "special",
-							},
-						},
+					BootstrapConfig: server.BootstrapConfig{
 						Users: []server.User{
 							{
 								Name:      "username",
 								AccessKey: "access-key",
 								Password:  "the-password",
+								InfraRole: "admin",
 							},
 						},
 					},
@@ -396,11 +327,22 @@ api:
 }
 
 func TestServerCmd_WithSecretsConfig(t *testing.T) {
-	pgDriver := database.PostgresDriver(t, "_cmd")
-	patchRunServer(t, noServerRun)
+	pgDriver := database.PostgresDriver(t, "cmd")
+
+	var actual server.Options
+	patchRunServer(t, func(ctx context.Context, s *server.Server) error {
+		actual = s.Options()
+		return nil
+	})
+
+	dir := fs.NewDir(t, t.Name())
+
+	rootKeyPath := dir.Join("root.key")
+	accessKeyPath := dir.Join("accessKey")
 
 	content := `
       dbConnectionString: ` + pgDriver.DSN + `
+      dbEncryptionKey: ` + rootKeyPath + `
       addr:
         http: "127.0.0.1:0"
         https: "127.0.0.1:0"
@@ -410,23 +352,37 @@ func TestServerCmd_WithSecretsConfig(t *testing.T) {
         ca: testdata/pki/localhost.crt
         caPrivateKey: file:testdata/pki/localhost.key
 
-      secrets:
-        - kind: env
-          name: base64env
-          config:
-            base64: true
-      keys:
-        - kind: native
-          config:
-            secretProvider: base64env
+
+      users:
+        - name: user1@example.com
+          password: env:USER1_PASSWORD
+          accessKey: file:` + accessKeyPath + `
+        - name: user2@example.com
+          password: plaintext:foo
 `
 
-	dir := fs.NewDir(t, t.Name(), fs.WithFile("cfg.yaml", content))
+	fs.Apply(t, dir,
+		fs.WithFile("cfg.yaml", content),
+		fs.WithFile("accessKey", "0123456789.012345678901234567890123"))
 	t.Setenv("HOME", dir.Path())
+	t.Setenv("USER1_PASSWORD", "the-password-1")
 
 	ctx := context.Background()
 	err := Run(ctx, "server", "--config-file", dir.Join("cfg.yaml"))
 	assert.NilError(t, err)
+
+	expected := []server.User{
+		{
+			Name:      "user1@example.com",
+			Password:  "the-password-1",
+			AccessKey: "0123456789.012345678901234567890123",
+		},
+		{
+			Name:     "user2@example.com",
+			Password: "foo",
+		},
+	}
+	assert.DeepEqual(t, actual.BootstrapConfig.Users, expected)
 }
 
 func patchRunServer(t *testing.T, fn func(context.Context, *server.Server) error) {
@@ -509,6 +465,71 @@ func TestCanonicalPath(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(fmt.Sprintf("in=%v out=%v", tc.path, tc.expected), func(t *testing.T) {
+			run(t, tc)
+		})
+	}
+}
+
+func TestServerCmd_DeprecatedConfig(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir) // Windows
+
+	type testCase struct {
+		name        string
+		setup       func(t *testing.T, cmd *cobra.Command)
+		expectedErr string
+	}
+
+	run := func(t *testing.T, tc testCase) {
+		patchRunServer(t, noServerRun)
+
+		cmd := newServerCmd()
+		cmd.SetArgs([]string{}) // prevent reading of os.Args
+		if tc.setup != nil {
+			tc.setup(t, cmd)
+		}
+
+		err := cmd.Execute()
+		assert.ErrorContains(t, err, tc.expectedErr)
+	}
+
+	testCases := []testCase{
+		{
+			name: "dbEncryptionKeyProvider",
+			setup: func(t *testing.T, cmd *cobra.Command) {
+				t.Setenv("INFRA_SERVER_DB_ENCRYPTION_KEY_PROVIDER", "vault")
+			},
+			expectedErr: "dbEncryptionKeyProvider is no longer supported",
+		},
+		{
+			name: "grants",
+			setup: func(t *testing.T, cmd *cobra.Command) {
+				content := `grants: []`
+
+				dir := fs.NewDir(t, t.Name(),
+					fs.WithFile("cfg.yaml", content))
+
+				t.Setenv("INFRA_SERVER_CONFIG_FILE", dir.Join("cfg.yaml"))
+			},
+			expectedErr: "grants can no longer be defined from config",
+		},
+		{
+			name: "providers",
+			setup: func(t *testing.T, cmd *cobra.Command) {
+				content := `providers: []`
+
+				dir := fs.NewDir(t, t.Name(),
+					fs.WithFile("cfg.yaml", content))
+
+				t.Setenv("INFRA_SERVER_CONFIG_FILE", dir.Join("cfg.yaml"))
+			},
+			expectedErr: "providers can no longer be defined from config",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
 			run(t, tc)
 		})
 	}

@@ -4,17 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/gin-gonic/gin"
-	"github.com/infrahq/secrets"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/rs/zerolog"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/infrahq/infra/internal"
@@ -23,10 +25,13 @@ import (
 	"github.com/infrahq/infra/internal/logging"
 	"github.com/infrahq/infra/internal/repeat"
 	"github.com/infrahq/infra/internal/server/data"
+	"github.com/infrahq/infra/internal/server/data/encrypt"
 	"github.com/infrahq/infra/internal/server/email"
 	"github.com/infrahq/infra/internal/server/models"
+	"github.com/infrahq/infra/internal/server/providers"
 	"github.com/infrahq/infra/internal/server/redis"
 	"github.com/infrahq/infra/metrics"
+	"github.com/infrahq/infra/uid"
 )
 
 type Options struct {
@@ -55,15 +60,14 @@ type Options struct {
 	GoogleClientID     string
 	GoogleClientSecret string
 
-	DBEncryptionKey         string
-	DBEncryptionKeyProvider string
-	DBHost                  string
-	DBPort                  int
-	DBName                  string
-	DBUsername              string
-	DBPassword              string
-	DBParameters            string
-	DBConnectionString      string
+	DBEncryptionKey    string
+	DBHost             string
+	DBPort             int
+	DBName             string
+	DBUsername         string
+	DBPassword         string
+	DBParameters       string
+	DBConnectionString string
 
 	EmailAppDomain   string
 	EmailFromAddress string
@@ -77,10 +81,7 @@ type Options struct {
 	// LoginDomainPrefix that users will be sent to after logging in with Google
 	LoginDomainPrefix string
 
-	Keys    []KeyProvider
-	Secrets []SecretProvider
-
-	Config
+	BootstrapConfig
 
 	Addr ListenerOptions
 	UI   UIOptions
@@ -88,6 +89,17 @@ type Options struct {
 	API  APIOptions
 
 	DB data.NewDBOptions
+
+	DeprecatedConfig
+}
+
+// DeprecatedConfig contains fields that are no longer used by server, but loading
+// values for these fields allows us to error when a config file value is no
+// longer supported.
+type DeprecatedConfig struct {
+	DBEncryptionKeyProvider string
+	Providers               any
+	Grants                  any
 }
 
 type ListenerOptions struct {
@@ -105,9 +117,9 @@ type TLSOptions struct {
 	// certificate, or that will be used to generate a certificate if one was
 	// not provided.
 	CA           types.StringOrFile
-	CAPrivateKey string
+	CAPrivateKey types.StringOrFile
 	Certificate  types.StringOrFile
-	PrivateKey   string
+	PrivateKey   types.StringOrFile
 
 	// ACME enables automated certificate management. When set to true a TLS
 	// certificate will be requested from Let's Encrypt, which will be cached
@@ -125,8 +137,6 @@ type Server struct {
 	db              *data.DB
 	redis           *redis.Redis
 	tel             *Telemetry
-	secrets         map[string]secrets.SecretStorage
-	keys            map[string]secrets.SymmetricKeyProvider
 	Addrs           Addrs
 	routines        []routine
 	metricsRegistry *prometheus.Registry
@@ -141,11 +151,7 @@ type Addrs struct {
 
 // newServer creates a Server with base dependencies initialized to zero values.
 func newServer(options Options) *Server {
-	return &Server{
-		options: options,
-		secrets: map[string]secrets.SecretStorage{},
-		keys:    map[string]secrets.SymmetricKeyProvider{},
-	}
+	return &Server{options: options}
 }
 
 // New creates a Server, and initializes it. The returned Server is ready to run.
@@ -154,28 +160,33 @@ func New(options Options) (*Server, error) {
 		return nil, errors.New("cannot enable signup without setting base domain")
 	}
 
+	if options.DBEncryptionKeyProvider != "" && options.DBEncryptionKeyProvider != "native" {
+		return nil, errors.New("dbEncryptionKeyProvider is no longer supported, " +
+			"use a file for the root key and set dbEncryptionKey to the path of the file")
+	}
+	if options.Grants != nil {
+		return nil, fmt.Errorf("grants can no longer be defined from config. " +
+			"Please use https://github.com/infrahq/terraform-provider-infra or the API")
+	}
+	if options.Providers != nil {
+		return nil, fmt.Errorf("providers can no longer be defined from config. " +
+			"Please use https://github.com/infrahq/terraform-provider-infra or the API")
+	}
+
 	server := newServer(options)
 
-	if err := importSecrets(options.Secrets, server.secrets); err != nil {
-		return nil, fmt.Errorf("secrets config: %w", err)
-	}
-
-	if err := importKeyProviders(options.Keys, server.secrets, server.keys); err != nil {
-		return nil, fmt.Errorf("key config: %w", err)
-	}
-
-	dsn, err := getPostgresConnectionString(options, server.secrets)
+	dsn, err := getPostgresConnectionString(options)
 	if err != nil {
 		return nil, fmt.Errorf("postgres dsn: %w", err)
 	}
 	options.DB.DSN = dsn
+	options.DB.RootKeyFilePath = options.DBEncryptionKey
 
-	dbKeyProvider, ok := server.keys[options.DBEncryptionKeyProvider]
-	if !ok {
-		return nil, fmt.Errorf("key provider %s not configured", options.DBEncryptionKeyProvider)
+	if _, err := os.Stat(options.DB.RootKeyFilePath); errors.Is(err, fs.ErrNotExist) {
+		if err := encrypt.CreateRootKey(options.DB.RootKeyFilePath); err != nil {
+			return nil, err
+		}
 	}
-	options.DB.EncryptionKeyProvider = dbKeyProvider
-	options.DB.RootKeyID = options.DBEncryptionKey
 
 	db, err := data.NewDB(options.DB)
 	if err != nil {
@@ -184,20 +195,13 @@ func New(options Options) (*Server, error) {
 	server.db = db
 	server.metricsRegistry = setupMetrics(server.db)
 
-	redisPassword, err := secrets.GetSecret(options.Redis.Password, server.secrets)
-	if err != nil {
-		return nil, fmt.Errorf("redis: %w", err)
-	}
-
-	options.Redis.Password = redisPassword
-	redis, err := redis.NewRedis(options.Redis)
+	server.redis, err = redis.NewRedis(options.Redis)
 	if err != nil {
 		return nil, err
 	}
-	server.redis = redis
 
 	if options.EnableTelemetry {
-		server.tel = NewTelemetry(server.db, db.DefaultOrgSettings.ID)
+		server.tel = NewTelemetry(server.db, db.DefaultOrg.InstallID)
 	}
 
 	if options.GoogleClientID != "" {
@@ -216,7 +220,7 @@ func New(options Options) (*Server, error) {
 		}
 	}
 
-	if err := server.loadConfig(server.options.Config); err != nil {
+	if err := server.loadConfig(server.options.BootstrapConfig); err != nil {
 		return nil, fmt.Errorf("configs: %w", err)
 	}
 
@@ -242,7 +246,10 @@ func (s *Server) Options() Options {
 func (s *Server) Run(ctx context.Context) error {
 	group, ctx := errgroup.WithContext(ctx)
 
-	s.SetupBackgroundJobs(ctx)
+	group.Go(backgroundJob(ctx, s.db, data.DeleteExpiredDeviceFlowAuthRequests, 10*time.Minute))
+	group.Go(backgroundJob(ctx, s.db, data.RemoveExpiredAccessKeys, 12*time.Hour))
+	group.Go(backgroundJob(ctx, s.db, data.RemoveExpiredPasswordResetTokens, 15*time.Minute))
+	group.Go(backgroundJob(ctx, s.db, data.DeleteExpiredUserPublicKeys, time.Hour))
 
 	if s.tel != nil {
 		group.Go(func() error {
@@ -296,7 +303,7 @@ func registerUIRoutes(router *gin.Engine, opts UIOptions) {
 		req.URL.Scheme = remote.Scheme
 		req.URL.Host = remote.Host
 	}
-	proxy.ErrorLog = log.New(logging.NewFilteredHTTPLogger(), "", 0)
+	proxy.ErrorLog = log.New(logging.L, "", 0)
 
 	router.Use(func(c *gin.Context) {
 		// Don't proxy /api/* paths
@@ -313,7 +320,7 @@ func (s *Server) listen() error {
 	ginutil.SetMode()
 	router := s.GenerateRoutes()
 
-	httpErrorLog := log.New(logging.NewFilteredHTTPLogger(), "", 0)
+	httpErrorLog := logging.HTTPErrorLog(zerolog.WarnLevel)
 	metricsServer := &http.Server{
 		ReadHeaderTimeout: 30 * time.Second,
 		ReadTimeout:       60 * time.Second,
@@ -340,7 +347,7 @@ func (s *Server) listen() error {
 		return err
 	}
 
-	tlsConfig, err := tlsConfigFromOptions(s.secrets, s.options.TLS)
+	tlsConfig, err := tlsConfigFromOptions(s.options.TLS)
 	if err != nil {
 		return fmt.Errorf("tls config: %w", err)
 	}
@@ -396,7 +403,7 @@ type routine struct {
 }
 
 // getPostgresConnectionString parses postgres configuration options and returns the connection string
-func getPostgresConnectionString(options Options, secretStorage map[string]secrets.SecretStorage) (string, error) {
+func getPostgresConnectionString(options Options) (string, error) {
 	var pgConn strings.Builder
 	pgConn.WriteString(options.DBConnectionString + " ")
 
@@ -410,12 +417,7 @@ func getPostgresConnectionString(options Options, secretStorage map[string]secre
 	}
 
 	if options.DBPassword != "" {
-		pass, err := secrets.GetSecret(options.DBPassword, secretStorage)
-		if err != nil {
-			return "", fmt.Errorf("postgres secret: %w", err)
-		}
-
-		fmt.Fprintf(&pgConn, "password=%s ", pass)
+		fmt.Fprintf(&pgConn, "password=%s ", options.DBPassword)
 	}
 
 	if options.DBPort > 0 {
@@ -450,4 +452,87 @@ func configureEmail(options Options) {
 	if len(options.SMTPServer) > 0 {
 		email.SMTPServer = options.SMTPServer
 	}
+}
+
+// providerUserUpdateThreshold is the duration of time that must pass before a
+// users session is attempted to be validated again with an external identity provider.
+// This prevents hitting IDP rate limits.
+const providerUserUpdateThreshold = 120 * time.Minute
+
+var ErrSyncFailed = fmt.Errorf("user sync failed")
+
+// syncIdentityInfo calls the identity provider used to authenticate this user session to update their current information
+func (s *Server) syncIdentityInfo(ctx context.Context, tx *data.Transaction, identity *models.Identity, sessionProviderID uid.ID) error {
+	var provider *models.Provider
+	if s.Google != nil && sessionProviderID == s.Google.ID {
+		provider = s.Google
+	} else {
+		var err error
+		provider, err = data.GetProvider(tx, data.GetProviderOptions{
+			ByID: sessionProviderID,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to get provider for user info: %w", err)
+		}
+
+		if provider.Kind == models.ProviderKindInfra {
+			// no external verification needed
+			logging.L.Trace().Msg("skipped verifying identity within infra provider, not required")
+			return nil
+		}
+	}
+
+	providerUser, err := data.GetProviderUser(tx, provider.ID, identity.ID)
+	if err != nil {
+		return fmt.Errorf("failed to get provider user to update: %w", err)
+	}
+
+	// if provider user was updated recently, skip checking this now to avoid hitting rate limits
+	if time.Since(providerUser.LastUpdate) > providerUserUpdateThreshold {
+		oidc, err := s.providerClient(ctx, provider, providerUser.RedirectURL)
+		if err != nil {
+			return fmt.Errorf("update provider client: %w", err)
+		}
+
+		// update current identity provider groups and account status
+		_, err = data.SyncProviderUser(ctx, tx, providerUser, oidc)
+		if err != nil {
+			if errors.Is(err, internal.ErrBadGateway) {
+				return err
+			}
+
+			logging.L.Info().Msg("user session expired, pruning keys created for this session")
+
+			if nestedErr := data.DeleteAccessKeys(tx, data.DeleteAccessKeysOptions{ByIssuedForID: providerUser.IdentityID, ByProviderID: providerUser.ProviderID}); nestedErr != nil {
+				logging.Errorf("failed to revoke invalid user session: %s", nestedErr)
+			}
+
+			if nestedErr := data.DeleteProviderUsers(tx, data.DeleteProviderUsersOptions{ByIdentityID: providerUser.IdentityID, ByProviderID: providerUser.ProviderID}); nestedErr != nil {
+				logging.Errorf("failed to delete provider user: %s", nestedErr)
+			}
+
+			return fmt.Errorf("%w: %s", ErrSyncFailed, err)
+		}
+
+		providerUser.LastUpdate = time.Now().UTC()
+		if err := data.UpdateProviderUser(tx, providerUser); err != nil {
+			return fmt.Errorf("update idp user: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (s *Server) providerClient(ctx context.Context, provider *models.Provider, redirectURL string) (providers.OIDCClient, error) {
+	if c := providers.OIDCClientFromContext(ctx); c != nil {
+		// oidc is added to the context during unit tests
+		return c, nil
+	}
+
+	if provider.ID == models.InternalGoogleProviderID {
+		// load the secret google information now, it is not set by default to avoid the possibility of returning this secret info externally
+		provider = s.Google
+	}
+
+	return providers.NewOIDCClient(*provider, string(provider.ClientSecret), redirectURL), nil
 }

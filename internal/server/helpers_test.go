@@ -40,9 +40,9 @@ func createOtherOrg(t *testing.T, db *data.DB) organizationData {
 	admin := createAdmin(t, tx)
 
 	token := &models.AccessKey{
-		IssuedFor:  admin.ID,
-		ProviderID: data.InfraProvider(tx).ID,
-		ExpiresAt:  time.Now().Add(1000 * time.Second),
+		IssuedForID: admin.ID,
+		ProviderID:  data.InfraProvider(tx).ID,
+		ExpiresAt:   time.Now().Add(1000 * time.Second),
 	}
 
 	accessKey, err := data.CreateAccessKey(tx, token)
@@ -59,7 +59,7 @@ func createOtherOrg(t *testing.T, db *data.DB) organizationData {
 func adminAccessKey(s *Server) string {
 	for _, id := range s.options.Users {
 		if id.Name == "admin@example.com" {
-			return id.AccessKey
+			return string(id.AccessKey)
 		}
 	}
 
@@ -72,19 +72,15 @@ func withAdminUser(_ *testing.T, opts *Options) {
 	opts.Users = append(opts.Users, User{
 		Name:      "admin@example.com",
 		AccessKey: "BlgpvURSGF.NdcemBdzxLTGIcjPXwPoZNrb",
-	})
-	opts.Grants = append(opts.Grants, Grant{
-		User:     "admin@example.com",
-		Role:     "admin",
-		Resource: "infra",
+		InfraRole: "admin",
 	})
 }
 
 func withSupportAdminGrant(_ *testing.T, opts *Options) {
-	opts.Grants = append(opts.Grants, Grant{
-		User:     "admin@example.com",
-		Role:     "support-admin",
-		Resource: "infra",
+	opts.Users = append(opts.Users, User{
+		Name:      "admin@example.com",
+		AccessKey: "BlgpvURSGF.NdcemBdzxLTGIcjPXwPoZNrb",
+		InfraRole: "support-admin",
 	})
 }
 
@@ -101,7 +97,7 @@ func createAdmin(t *testing.T, db data.WriteTxn) *models.Identity {
 	assert.NilError(t, err)
 
 	err = data.CreateGrant(db, &models.Grant{
-		Subject:   uid.NewIdentityPolymorphicID(user.ID),
+		Subject:   models.NewSubjectForUser(user.ID),
 		Resource:  "infra",
 		Privilege: models.InfraAdminRole,
 	})
@@ -119,9 +115,9 @@ func createAccessKey(t *testing.T, db data.WriteTxn, email string) (string, *mod
 	provider := data.InfraProvider(db)
 
 	token := &models.AccessKey{
-		IssuedFor:  user.ID,
-		ProviderID: provider.ID,
-		ExpiresAt:  time.Now().Add(10 * time.Second),
+		IssuedForID: user.ID,
+		ProviderID:  provider.ID,
+		ExpiresAt:   time.Now().Add(10 * time.Second),
 	}
 
 	body, err := data.CreateAccessKey(db, token)
@@ -161,7 +157,7 @@ func createUser(t *testing.T, srv *Server, routes Routes, email string) *api.Cre
 	// nolint:noctx
 	req := httptest.NewRequest(http.MethodPost, "/api/users", bytes.NewReader(body))
 	req.Header.Add("Authorization", "Bearer "+adminAccessKey(srv))
-	req.Header.Add("Infra-Version", "0.14")
+	req.Header.Add("Infra-Version", apiVersionLatest)
 
 	resp := httptest.NewRecorder()
 	routes.ServeHTTP(resp, req)

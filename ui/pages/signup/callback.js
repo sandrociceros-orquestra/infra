@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useRouter } from 'next/router'
 
 import { useServerConfig } from '../../lib/serverconfig'
+import { saveToVisitedOrgs } from '../../lib/login'
 import LoginLayout from '../../components/layouts/login'
 import OrgSignup from '../../components/org-signup'
 
@@ -55,7 +56,9 @@ export default function Callback() {
 
       // redirect to the new org subdomain
       let created = await jsonBody(res)
+      saveToVisitedOrgs(`${created?.organization?.domain}`, orgName)
 
+      window.localStorage.removeItem('redirectURL')
       window.location = `${window.location.protocol}//${created?.organization?.domain}`
     } catch (e) {
       setError(e.message)

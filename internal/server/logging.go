@@ -9,7 +9,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/rs/zerolog"
 
-	"github.com/infrahq/infra/internal/access"
 	"github.com/infrahq/infra/internal/logging"
 )
 
@@ -65,13 +64,19 @@ func loggingMiddleware(enableSampling bool) gin.HandlerFunc {
 			event = event.Int64("contentLength", c.Request.ContentLength)
 		}
 
-		rCtx := access.GetRequestContext(c)
+		rCtx := getRequestContext(c)
 		if user := rCtx.Authenticated.User; user != nil {
 			event = event.Str("userID", user.ID.String())
+		} else if rCtx.Response != nil && rCtx.Response.LoginUserID != 0 {
+			event = event.Str("userID", rCtx.Response.LoginUserID.String())
 		}
+
 		if org := rCtx.Authenticated.Organization; org != nil {
 			event = event.Str("orgID", org.ID.String())
+		} else if rCtx.Response != nil && rCtx.Response.SignupOrgID != 0 {
+			event = event.Str("orgID", rCtx.Response.SignupOrgID.String())
 		}
+
 		rCtx.Response.ApplyLogFields(event)
 
 		event.Dur("elapsed", time.Since(begin)).

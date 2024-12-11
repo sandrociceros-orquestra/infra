@@ -4,11 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
-
-	"github.com/gin-gonic/gin"
-	"golang.org/x/crypto/bcrypt"
 
 	"github.com/infrahq/infra/api"
 	"github.com/infrahq/infra/internal"
@@ -19,7 +17,7 @@ import (
 	"github.com/infrahq/infra/internal/server/email"
 	"github.com/infrahq/infra/internal/server/models"
 	"github.com/infrahq/infra/internal/server/providers"
-	"github.com/infrahq/infra/uid"
+	"github.com/infrahq/infra/internal/validate"
 )
 
 func (a *API) SignupRoute() route[api.SignupRequest, *api.SignupResponse] {
@@ -31,7 +29,7 @@ func (a *API) SignupRoute() route[api.SignupRequest, *api.SignupResponse] {
 	}
 }
 
-func (a *API) Signup(c *gin.Context, r *api.SignupRequest) (*api.SignupResponse, error) {
+func (a *API) Signup(rCtx access.RequestContext, r *api.SignupRequest) (*api.SignupResponse, error) {
 	if !a.server.options.EnableSignup {
 		return nil, fmt.Errorf("%w: signup is disabled", internal.ErrBadRequest)
 	}
@@ -47,7 +45,7 @@ func (a *API) Signup(c *gin.Context, r *api.SignupRequest) (*api.SignupResponse,
 		}
 		// check if an org exists with their desired sub-domain
 		// this has to be done here since the auth code is single-use
-		if err := access.DomainAvailable(c, fmt.Sprintf("%s.%s", r.Subdomain, a.server.options.BaseDomain)); err != nil {
+		if err := access.DomainAvailable(rCtx, fmt.Sprintf("%s.%s", r.Subdomain, a.server.options.BaseDomain)); err != nil {
 			return nil, err
 		}
 		// perform OIDC authentication
@@ -56,7 +54,7 @@ func (a *API) Signup(c *gin.Context, r *api.SignupRequest) (*api.SignupResponse,
 			RedirectURL: r.Social.RedirectURL,
 			Code:        r.Social.Code,
 		}
-		idpAuth, err := a.socialSignupUserAuth(c, provider, auth)
+		idpAuth, err := a.socialSignupUserAuth(rCtx, provider, auth)
 		if err != nil {
 			return nil, err // make sure to return this error directly for an unauthorized response
 		}
@@ -69,7 +67,7 @@ func (a *API) Signup(c *gin.Context, r *api.SignupRequest) (*api.SignupResponse,
 			Org:       &models.Organization{Name: r.OrgName},
 			SubDomain: r.Subdomain,
 		}
-		created, err = createOrgAndUserForSignup(c, keyExpires, a.server.options.BaseDomain, details)
+		created, err = createOrgAndUserForSignup(rCtx, keyExpires, a.server.options.BaseDomain, details)
 		if err != nil {
 			return nil, handleSignupError(err)
 		}
@@ -83,7 +81,7 @@ func (a *API) Signup(c *gin.Context, r *api.SignupRequest) (*api.SignupResponse,
 			SubDomain: r.Subdomain,
 		}
 		var err error
-		created, err = createOrgAndUserForSignup(c, keyExpires, a.server.options.BaseDomain, details)
+		created, err = createOrgAndUserForSignup(rCtx, keyExpires, a.server.options.BaseDomain, details)
 		if err != nil {
 			return nil, handleSignupError(err)
 		}
@@ -105,7 +103,7 @@ func (a *API) Signup(c *gin.Context, r *api.SignupRequest) (*api.SignupResponse,
 		Domain:  a.server.options.BaseDomain,
 		Expires: time.Now().Add(1 * time.Minute),
 	}
-	setCookie(c.Request, c.Writer, cookie)
+	setCookie(rCtx.Request, rCtx.Response.HTTPWriter, cookie)
 
 	a.t.User(created.Identity.ID.String(), created.Identity.Name)
 	a.t.Org(created.Organization.ID.String(), created.Identity.ID.String(), created.Organization.Name, created.Organization.Domain)
@@ -143,15 +141,15 @@ func handleSignupError(err error) error {
 	return err
 }
 
-func (a *API) socialSignupUserAuth(c *gin.Context, provider *models.Provider, auth *authn.OIDCAuthn) (*providers.IdentityProviderAuth, error) {
-	providerClient, err := a.providerClient(c, provider, auth.RedirectURL)
+func (a *API) socialSignupUserAuth(rCtx access.RequestContext, provider *models.Provider, auth *authn.OIDCAuthn) (*providers.IdentityProviderAuth, error) {
+	providerClient, err := a.server.providerClient(rCtx.Request.Context(), provider, auth.RedirectURL)
 	if err != nil {
 		return nil, fmt.Errorf("sign-up provider client: %w", err)
 	}
 	auth.OIDCProviderClient = providerClient
 
 	// exchange code for tokens from identity provider (these tokens are for the IDP, not Infra)
-	result, err := auth.OIDCProviderClient.ExchangeAuthCodeForProviderTokens(c, auth.Code)
+	result, err := auth.OIDCProviderClient.ExchangeAuthCodeForProviderTokens(rCtx.Request.Context(), auth.Code)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, fmt.Errorf("%w: %s", internal.ErrBadGateway, err.Error())
@@ -193,12 +191,11 @@ type SignupDetails struct {
 
 // createOrgAndUserForSignup creates a user identity using the supplied name and password and
 // grants the identity "admin" access to Infra.
-func createOrgAndUserForSignup(c *gin.Context, keyExpiresAt time.Time, baseDomain string, details SignupDetails) (*NewOrgDetails, error) {
+func createOrgAndUserForSignup(rCtx access.RequestContext, keyExpiresAt time.Time, baseDomain string, details SignupDetails) (*NewOrgDetails, error) {
 	if details.Social == nil && details.User == nil {
 		return nil, fmt.Errorf("sign-up requires social login details or user details")
 	}
 
-	rCtx := access.GetRequestContext(c)
 	db := rCtx.DBTxn
 
 	details.Org.Domain = sanitizedDomain(details.SubDomain, baseDomain)
@@ -219,6 +216,9 @@ func createOrgAndUserForSignup(c *gin.Context, keyExpiresAt time.Time, baseDomai
 		details.Org.AllowedDomains = []string{allowedLoginDomain}
 	}
 
+	// inherit install_id from default organization
+	details.Org.InstallID = rCtx.DataDB.DefaultOrg.InstallID
+
 	if err := data.CreateOrganization(db, details.Org); err != nil {
 		return nil, fmt.Errorf("create org on sign-up: %w", err)
 	}
@@ -226,7 +226,7 @@ func createOrgAndUserForSignup(c *gin.Context, keyExpiresAt time.Time, baseDomai
 	db = db.WithOrgID(details.Org.ID)
 	rCtx.DBTxn = db
 	rCtx.Authenticated.Organization = details.Org
-	c.Set(access.RequestContextKey, rCtx)
+	rCtx.Response.SignupOrgID = details.Org.ID
 
 	var identity *models.Identity
 	bearer := ""
@@ -241,12 +241,12 @@ func createOrgAndUserForSignup(c *gin.Context, keyExpiresAt time.Time, baseDomai
 		}
 
 		var err error
-		identity, bearer, err = signupUser(c, keyExpiresAt, user)
+		identity, bearer, err = signupUser(rCtx, keyExpiresAt, user)
 		if err != nil {
 			return nil, err
 		}
 
-		hash, err := bcrypt.GenerateFromPassword([]byte(details.User.Password), bcrypt.DefaultCost)
+		hash, err := access.GenerateFromPassword(details.User.Password)
 		if err != nil {
 			return nil, fmt.Errorf("hash password on sign-up: %w", err)
 		}
@@ -273,7 +273,7 @@ func createOrgAndUserForSignup(c *gin.Context, keyExpiresAt time.Time, baseDomai
 		}
 
 		var err error
-		identity, bearer, err = signupUser(c, keyExpiresAt, user)
+		identity, bearer, err = signupUser(rCtx, keyExpiresAt, user)
 		if err != nil {
 			return nil, err
 		}
@@ -290,8 +290,7 @@ func createOrgAndUserForSignup(c *gin.Context, keyExpiresAt time.Time, baseDomai
 }
 
 // signupUser creates the user identity and grants for a new org
-func signupUser(c *gin.Context, keyExpiresAt time.Time, user *models.ProviderUser) (*models.Identity, string, error) {
-	rCtx := getRequestContext(c)
+func signupUser(rCtx access.RequestContext, keyExpiresAt time.Time, user *models.ProviderUser) (*models.Identity, string, error) {
 	tx := rCtx.DBTxn
 
 	identity := &models.Identity{
@@ -309,7 +308,7 @@ func signupUser(c *gin.Context, keyExpiresAt time.Time, user *models.ProviderUse
 	}
 
 	err = data.CreateGrant(tx, &models.Grant{
-		Subject:   uid.NewIdentityPolymorphicID(identity.ID),
+		Subject:   models.NewSubjectForUser(identity.ID),
 		Privilege: models.InfraAdminRole,
 		Resource:  access.ResourceInfraAPI,
 		CreatedBy: identity.ID,
@@ -320,7 +319,8 @@ func signupUser(c *gin.Context, keyExpiresAt time.Time, user *models.ProviderUse
 
 	// grant the user a session on initial sign-up
 	accessKey := &models.AccessKey{
-		IssuedFor:     identity.ID,
+		IssuedForID:   identity.ID,
+		IssuedForKind: models.IssuedForKindUser,
 		IssuedForName: identity.Name,
 		ProviderID:    user.ProviderID,
 		ExpiresAt:     keyExpiresAt,
@@ -333,12 +333,45 @@ func signupUser(c *gin.Context, keyExpiresAt time.Time, user *models.ProviderUse
 	}
 
 	// Update the request context so that logging middleware can include the userID
-	rCtx.Authenticated.User = identity
-	c.Set(access.RequestContextKey, rCtx)
+	rCtx.Response.LoginUserID = identity.ID
 
 	return identity, bearer, nil
 }
 
 func sanitizedDomain(subDomain, serverBaseDomain string) string {
 	return strings.ToLower(subDomain) + "." + serverBaseDomain
+}
+
+// See docs/dev/api-versioned-handlers.md for a guide to adding new version handlers.
+func (a *API) addPreviousVersionHandlersSignup() {
+	type signupOrgV0_19_0 struct {
+		Name      string `json:"name"`
+		Subdomain string `json:"subDomain"`
+	}
+	type signupRequestV0_19_0 struct {
+		Name     string           `json:"name"`
+		Password string           `json:"password"`
+		Org      signupOrgV0_19_0 `json:"org"`
+	}
+
+	addVersionHandler(a, http.MethodPost, "/api/signup", "0.19.0",
+		route[signupRequestV0_19_0, *api.SignupResponse]{
+			handler: func(rCtx access.RequestContext, reqOld *signupRequestV0_19_0) (*api.SignupResponse, error) {
+				req := &api.SignupRequest{
+					User: &api.SignupUser{
+						UserName: reqOld.Name,
+						Password: reqOld.Password,
+					},
+					OrgName:   reqOld.Org.Name,
+					Subdomain: reqOld.Org.Subdomain,
+				}
+
+				if err := validate.Validate(req); err != nil {
+					return nil, err
+				}
+
+				return a.Signup(rCtx, req)
+			},
+		},
+	)
 }

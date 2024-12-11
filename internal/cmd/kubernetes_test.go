@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"context"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,29 +23,20 @@ func TestUpdateKubeconfig(t *testing.T) {
 	serverOpts := defaultServerOptions(home)
 	setupServerOptions(t, &serverOpts)
 	accessKey := "aaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbb"
-	serverOpts.Config.Users = []server.User{
+	serverOpts.BootstrapConfig.Users = []server.User{
 		{
 			Name:      "admin@local",
-			AccessKey: accessKey,
+			AccessKey: server.Secret(accessKey),
+			InfraRole: "admin",
 		},
 	}
-	serverOpts.Config.Grants = []server.Grant{
-		{
-			User:     "admin@local",
-			Resource: "infra",
-			Role:     "admin",
-		},
-		{
-			User:     "admin@local",
-			Resource: "my-first-kubernetes-cluster",
-		},
-		{
-			User:     "admin@local",
-			Resource: "my-first-ssh-server",
-		},
-	}
+
 	srv, err := server.New(serverOpts)
 	assert.NilError(t, err)
+
+	createGrants(t, srv.DB(),
+		api.GrantRequest{UserName: "admin@local", Resource: "my-first-kubernetes-cluster", Privilege: "connect"},
+		api.GrantRequest{UserName: "admin@local", Resource: "my-first-ssh-server", Privilege: "connect"})
 
 	ctx := context.Background()
 	runAndWait(ctx, t, srv.Run)
@@ -427,7 +417,7 @@ func TestSafelyWriteConfigToFile(t *testing.T) {
 	assert.Equal(t, actual.Contexts["infra:cluster:default"].Namespace, "default")
 
 	// check that the temp file is gone
-	files, err := ioutil.ReadDir(home)
+	files, err := os.ReadDir(home)
 	assert.NilError(t, err)
 
 	for _, file := range files {

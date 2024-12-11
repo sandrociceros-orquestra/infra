@@ -5,22 +5,11 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/gin-gonic/gin"
-
 	"github.com/infrahq/infra/internal/server/data"
-	"github.com/infrahq/infra/uid"
+	"github.com/infrahq/infra/internal/server/models"
 )
 
 const ResourceInfraAPI = "infra"
-
-// RequireInfraRole checks that the identity in the context can perform an action on a resource based on their granted roles
-func RequireInfraRole(c *gin.Context, oneOfRoles ...string) (*data.Transaction, error) {
-	rCtx := GetRequestContext(c)
-	if err := IsAuthorized(rCtx, oneOfRoles...); err != nil {
-		return nil, err
-	}
-	return rCtx.DBTxn, nil
-}
 
 var ErrNotAuthorized = errors.New("not authorized")
 
@@ -77,9 +66,10 @@ func IsAuthorized(rCtx RequestContext, requiredRole ...string) error {
 	if user == nil {
 		return fmt.Errorf("no authenticated user")
 	}
+
 	grants, err := data.ListGrants(rCtx.DBTxn, data.ListGrantsOptions{
 		Pagination:                 &data.Pagination{Limit: 1},
-		BySubject:                  uid.NewIdentityPolymorphicID(user.ID),
+		BySubject:                  models.NewSubjectForUser(user.ID),
 		ByPrivileges:               requiredRole,
 		ByResource:                 ResourceInfraAPI,
 		IncludeInheritedFromGroups: true,

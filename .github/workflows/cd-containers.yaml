@@ -71,7 +71,7 @@ jobs:
             type=edge
       - uses: docker/setup-buildx-action@v2
       - uses: docker/setup-qemu-action@v2
-      - uses: docker/build-push-action@v3
+      - uses: docker/build-push-action@v4
         with:
           context: ${{ env.CONTEXT }}
           push: true
@@ -83,6 +83,7 @@ jobs:
           labels: ${{ steps.metadata.outputs.labels }}
           cache-from: type=registry,ref=${{ env.IMAGE }}:edge
           cache-to: type=inline
+          provenance: false
 
   synchronize:
     runs-on: ubuntu-latest
@@ -111,10 +112,13 @@ jobs:
             argocd-image-updater
       - run: |
           for TRY in $(seq $MAX_TRIES); do
-            argocd-image-updater run --once --match-application-label=ci.infrahq.com/component=${{ matrix.component.name }} && exit 0
+            # argocd-image-updater exits 0 so need to consult the logs to determine if there's a failure
+            argocd-image-updater run --once --match-application-label=ci.infrahq.com/component=${{ matrix.component.name }} 2>&1 \
+              | tee /dev/stderr \
+              | grep level=error \
+              || exit 0
             sleep $(( 3 ** $TRY ))
           done
-
           # all attempts to sync image have failed
           exit 1
         env:

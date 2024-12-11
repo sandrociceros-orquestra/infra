@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Masterminds/semver/v3"
 	gocmp "github.com/google/go-cmp/cmp"
+	"github.com/prometheus/client_golang/prometheus"
 	"gopkg.in/square/go-jose.v2"
 	"gotest.tools/v3/assert"
 
@@ -28,29 +30,24 @@ func TestWellKnownJWKs(t *testing.T) {
 	routes := srv.GenerateRoutes()
 	srv.options.EnableSignup = true
 
+	var defaultKey jose.JSONWebKey
+	err := defaultKey.UnmarshalJSON(srv.db.DefaultOrg.PublicJWK)
+	assert.NilError(t, err)
+
 	otherOrg := &models.Organization{Name: "Other", Domain: "other.example.org"}
 	createOrgs(t, srv.db, otherOrg)
 
-	settings, err := data.GetSettings(srv.db)
-	assert.NilError(t, err)
-
-	var defaultKey jose.JSONWebKey
-	err = defaultKey.UnmarshalJSON(settings.PublicJWK)
-	assert.NilError(t, err)
-
 	otherOrgTx := txnForTestCase(t, srv.db, otherOrg.ID)
-	settings, err = data.GetSettings(otherOrgTx)
-	assert.NilError(t, err)
 
 	var otherOrgKey jose.JSONWebKey
-	err = otherOrgKey.UnmarshalJSON(settings.PublicJWK)
+	err = otherOrgKey.UnmarshalJSON(otherOrg.PublicJWK)
 	assert.NilError(t, err)
 
 	connector := data.InfraConnectorIdentity(otherOrgTx)
 	accessKey, err := data.CreateAccessKey(otherOrgTx, &models.AccessKey{
-		IssuedFor:  connector.ID,
-		ExpiresAt:  time.Now().Add(20 * time.Second),
-		ProviderID: data.InfraProvider(otherOrgTx).ID,
+		IssuedForID: connector.ID,
+		ExpiresAt:   time.Now().Add(20 * time.Second),
+		ProviderID:  data.InfraProvider(otherOrgTx).ID,
 	})
 	assert.NilError(t, err)
 
@@ -172,4 +169,20 @@ func TestWellKnownJWKs(t *testing.T) {
 
 var cmpWellKnownJWKsJSON = gocmp.Options{
 	gocmp.FilterPath(pathMapKey(`kid`, `x`), cmpAnyString),
+}
+
+func TestAPI_AddPreviousVersionHandlers_Order(t *testing.T) {
+	srv := newServer(Options{})
+	srv.metricsRegistry = prometheus.NewRegistry()
+	routes := srv.GenerateRoutes()
+
+	for routeID, versions := range routes.api.versions {
+		prev := semver.MustParse("0.0.0")
+		for _, v := range versions {
+			assert.Assert(t, prev.LessThan(v.version),
+				"handlers for %v are in the wrong order, %v should be before %v",
+				routeID, v.version, prev)
+			prev = v.version
+		}
+	}
 }

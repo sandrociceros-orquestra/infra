@@ -36,7 +36,7 @@ func TestAPI_ListGrants(t *testing.T) {
 
 		req := httptest.NewRequest(http.MethodPost, "/api/users", &buf)
 		req.Header.Add("Authorization", "Bearer "+adminAccessKey(srv))
-		req.Header.Add("Infra-Version", "0.12.3")
+		req.Header.Add("Infra-Version", apiVersionLatest)
 
 		resp := httptest.NewRecorder()
 		routes.ServeHTTP(resp, req)
@@ -61,7 +61,7 @@ func TestAPI_ListGrants(t *testing.T) {
 		// nolint:noctx
 		req := httptest.NewRequest(http.MethodPost, "/api/grants", &buf)
 		req.Header.Add("Authorization", "Bearer "+adminAccessKey(srv))
-		req.Header.Add("Infra-Version", "0.12.3")
+		req.Header.Add("Infra-Version", apiVersionLatest)
 
 		resp := httptest.NewRecorder()
 		routes.ServeHTTP(resp, req)
@@ -92,9 +92,9 @@ func TestAPI_ListGrants(t *testing.T) {
 	otherGroup := createGroup(t, "others", idOther)
 
 	token := &models.AccessKey{
-		IssuedFor:  idInGroup,
-		ProviderID: data.InfraProvider(srv.DB()).ID,
-		ExpiresAt:  time.Now().Add(10 * time.Minute),
+		IssuedForID: idInGroup,
+		ProviderID:  data.InfraProvider(srv.DB()).ID,
+		ExpiresAt:   time.Now().Add(10 * time.Minute),
 	}
 
 	accessKey, err := data.CreateAccessKey(srv.DB(), token)
@@ -114,7 +114,7 @@ func TestAPI_ListGrants(t *testing.T) {
 	run := func(t *testing.T, tc testCase) {
 		req := httptest.NewRequest(http.MethodGet, tc.urlPath, nil)
 		req.Header.Set("Authorization", "Bearer "+accessKey)
-		req.Header.Add("Infra-Version", "0.18.2")
+		req.Header.Add("Infra-Version", apiVersionLatest)
 
 		if tc.setup != nil {
 			tc.setup(t, req)
@@ -339,7 +339,7 @@ func TestAPI_ListGrants(t *testing.T) {
 			urlPath: "/api/grants?resource=res1",
 			setup: func(t *testing.T, req *http.Request) {
 				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
-				req.Header.Add("Infra-Version", "0.12.3")
+				req.Header.Add("Infra-Version", apiVersionLatest)
 			},
 			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
 				assert.Equal(t, resp.Code, http.StatusOK, resp.Body.String())
@@ -559,7 +559,7 @@ func TestAPI_ListGrants_InheritedGrants(t *testing.T) {
 
 		req := httptest.NewRequest(http.MethodPost, "/api/users", &buf)
 		req.Header.Add("Authorization", "Bearer "+adminAccessKey(srv))
-		req.Header.Add("Infra-Version", "0.12.3")
+		req.Header.Add("Infra-Version", apiVersionLatest)
 
 		resp := httptest.NewRecorder()
 		routes.ServeHTTP(resp, req)
@@ -591,9 +591,9 @@ func TestAPI_ListGrants_InheritedGrants(t *testing.T) {
 	loginAs := func(t *testing.T, userID uid.ID, req *http.Request) {
 		t.Helper()
 		token := &models.AccessKey{
-			IssuedFor:  userID,
-			ProviderID: data.InfraProvider(srv.DB()).ID,
-			ExpiresAt:  time.Now().Add(10 * time.Minute),
+			IssuedForID: userID,
+			ProviderID:  data.InfraProvider(srv.DB()).ID,
+			ExpiresAt:   time.Now().Add(10 * time.Minute),
 		}
 
 		var err error
@@ -606,12 +606,12 @@ func TestAPI_ListGrants_InheritedGrants(t *testing.T) {
 	err := data.CreateGrant(srv.DB(), &models.Grant{
 		Resource:  "infra",
 		Privilege: "view",
-		Subject:   uid.NewIdentityPolymorphicID(idInGroup),
+		Subject:   models.NewSubjectForUser(idInGroup),
 	})
 	assert.NilError(t, err)
 
 	err = data.CreateGrant(srv.DB(), &models.Grant{
-		Subject:   uid.NewGroupPolymorphicID(zoologistsID),
+		Subject:   models.NewSubjectForGroup(zoologistsID),
 		Privilege: "examine",
 		Resource:  "butterflies",
 	})
@@ -625,7 +625,7 @@ func TestAPI_ListGrants_InheritedGrants(t *testing.T) {
 
 	run := func(t *testing.T, tc testCase) {
 		req := httptest.NewRequest(http.MethodGet, tc.urlPath, nil)
-		req.Header.Add("Infra-Version", "0.12.3")
+		req.Header.Add("Infra-Version", apiVersionLatest)
 
 		if tc.setup != nil {
 			tc.setup(t, req)
@@ -832,7 +832,7 @@ func TestAPI_ListGrants_BlockingRequest_BlocksUntilUpdate(t *testing.T) {
 
 	// unrelated grant
 	err := data.CreateGrant(srv.db, &models.Grant{
-		Subject:   "i:abcd",
+		Subject:   models.NewSubjectForUser(222242),
 		Privilege: "view",
 		Resource:  "somethingelse",
 	})
@@ -841,7 +841,7 @@ func TestAPI_ListGrants_BlockingRequest_BlocksUntilUpdate(t *testing.T) {
 
 	// matching grant
 	err = data.CreateGrant(srv.db, &models.Grant{
-		Subject:   "i:abcd",
+		Subject:   models.NewSubjectForUser(222242),
 		Privilege: "view",
 		Resource:  "infra",
 	})
@@ -904,7 +904,7 @@ func TestAPI_ListGrants_BlockingRequest_NotFoundBlocksUntilUpdate(t *testing.T) 
 
 	// unrelated grant
 	err := data.CreateGrant(srv.db, &models.Grant{
-		Subject:   "i:abcd",
+		Subject:   models.NewSubjectForUser(222242),
 		Privilege: "view",
 		Resource:  "somethingelse",
 	})
@@ -913,7 +913,7 @@ func TestAPI_ListGrants_BlockingRequest_NotFoundBlocksUntilUpdate(t *testing.T) 
 
 	// matching grant
 	err = data.CreateGrant(srv.db, &models.Grant{
-		Subject:   "i:abcd",
+		Subject:   models.NewSubjectForUser(222242),
 		Privilege: "view",
 		Resource:  "deferred.ns1",
 	})
@@ -961,7 +961,7 @@ func TestAPI_CreateGrant(t *testing.T) {
 	assert.NilError(t, err)
 
 	supportAdminGrant := models.Grant{
-		Subject:   supportAdmin.PolyID(),
+		Subject:   models.NewSubjectForUser(supportAdmin.ID),
 		Privilege: models.InfraSupportAdminRole,
 		Resource:  "infra",
 	}
@@ -969,9 +969,9 @@ func TestAPI_CreateGrant(t *testing.T) {
 	assert.NilError(t, err)
 
 	token := &models.AccessKey{
-		IssuedFor:  supportAdmin.ID,
-		ProviderID: data.InfraProvider(srv.DB()).ID,
-		ExpiresAt:  time.Now().Add(10 * time.Second),
+		IssuedForID: supportAdmin.ID,
+		ProviderID:  data.InfraProvider(srv.DB()).ID,
+		ExpiresAt:   time.Now().Add(10 * time.Second),
 	}
 
 	supportAccessKeyStr, err := data.CreateAccessKey(srv.DB(), token)
@@ -988,7 +988,7 @@ func TestAPI_CreateGrant(t *testing.T) {
 	run := func(t *testing.T, tc testCase) {
 		body := jsonBody(t, tc.body)
 		req := httptest.NewRequest(http.MethodPost, "/api/grants", body)
-		req.Header.Add("Infra-Version", "0.18.2")
+		req.Header.Add("Infra-Version", apiVersionLatest)
 
 		if tc.setup != nil {
 			tc.setup(t, req)
@@ -1058,7 +1058,7 @@ func TestAPI_CreateGrant(t *testing.T) {
 					"updated": "%[4]v",
 					"wasCreated": true
 				}`,
-					accessKey.IssuedFor,
+					accessKey.IssuedForID,
 					models.InfraAdminRole,
 					someUser.ID.String(),
 					time.Now().UTC().Format(time.RFC3339),
@@ -1090,7 +1090,7 @@ func TestAPI_CreateGrant(t *testing.T) {
 					"updated": "%[4]v",
 					"wasCreated": true
 				}`,
-					accessKey.IssuedFor,
+					accessKey.IssuedForID,
 					models.InfraAdminRole,
 					someUser.ID.String(),
 					time.Now().UTC().Format(time.RFC3339),
@@ -1143,7 +1143,7 @@ func TestAPI_CreateGrant(t *testing.T) {
 					"updated": "%[4]v",
 					"wasCreated": true
 				}`,
-					accessKey.IssuedFor,
+					accessKey.IssuedForID,
 					models.InfraViewRole,
 					someGroup.String(),
 					time.Now().UTC().Format(time.RFC3339),
@@ -1242,7 +1242,7 @@ func TestAPI_CreateGrant(t *testing.T) {
 					"updated": "%[4]v",
 					"wasCreated": true
 				}`,
-					accessKey.IssuedFor,
+					accessKey.IssuedForID,
 					models.InfraAdminRole,
 					someUser.ID.String(),
 					time.Now().UTC().Format(time.RFC3339),
@@ -1290,7 +1290,7 @@ func TestAPI_DeleteGrant(t *testing.T) {
 	})
 	t.Run("admin for wrong organization", func(t *testing.T) {
 		grant := &models.Grant{
-			Subject:   uid.NewIdentityPolymorphicID(user.ID),
+			Subject:   models.NewSubjectForUser(user.ID),
 			Privilege: models.InfraViewRole,
 			Resource:  "something",
 		}
@@ -1309,7 +1309,7 @@ func TestAPI_DeleteGrant(t *testing.T) {
 
 	t.Run("not last infra admin is deleted", func(t *testing.T) {
 		grant2 := &models.Grant{
-			Subject:   uid.NewIdentityPolymorphicID(user.ID),
+			Subject:   models.NewSubjectForUser(user.ID),
 			Privilege: models.InfraAdminRole,
 			Resource:  "infra",
 		}
@@ -1329,7 +1329,7 @@ func TestAPI_DeleteGrant(t *testing.T) {
 
 	t.Run("last infra non-admin is deleted", func(t *testing.T) {
 		grant2 := &models.Grant{
-			Subject:   uid.NewIdentityPolymorphicID(user.ID),
+			Subject:   models.NewSubjectForUser(user.ID),
 			Privilege: models.InfraViewRole,
 			Resource:  "infra",
 		}
@@ -1349,7 +1349,7 @@ func TestAPI_DeleteGrant(t *testing.T) {
 
 	t.Run("last non-infra admin is deleted", func(t *testing.T) {
 		grant2 := &models.Grant{
-			Subject:   uid.NewIdentityPolymorphicID(user.ID),
+			Subject:   models.NewSubjectForUser(user.ID),
 			Privilege: "admin",
 			Resource:  "example",
 		}
@@ -1557,7 +1557,7 @@ func TestAPI_UpdateGrants(t *testing.T) {
 				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
 
 				grantToAdd := models.Grant{
-					Subject:   uid.NewIdentityPolymorphicID(user.ID),
+					Subject:   models.NewSubjectForUser(user.ID),
 					Privilege: models.InfraAdminRole,
 					Resource:  "another-cluster",
 				}
@@ -1590,7 +1590,7 @@ func TestAPI_UpdateGrants(t *testing.T) {
 				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
 
 				grantToAdd := models.Grant{
-					Subject:   uid.NewIdentityPolymorphicID(user.ID),
+					Subject:   models.NewSubjectForUser(user.ID),
 					Privilege: models.InfraAdminRole,
 					Resource:  "another-cluster2",
 				}
@@ -1623,7 +1623,7 @@ func TestAPI_UpdateGrants(t *testing.T) {
 				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
 
 				grantToAdd := models.Grant{
-					Subject:   uid.NewGroupPolymorphicID(group.ID),
+					Subject:   models.NewSubjectForGroup(group.ID),
 					Privilege: models.InfraAdminRole,
 					Resource:  "another-cluster3",
 				}
@@ -1740,5 +1740,4 @@ func TestAPI_UpdateGrants(t *testing.T) {
 			run(t, tc)
 		})
 	}
-
 }

@@ -61,10 +61,10 @@ func TestLoginCmd_Options(t *testing.T) {
 	opts := defaultServerOptions(dir)
 	setupServerOptions(t, &opts)
 	adminAccessKey := "aaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbb"
-	opts.Config.Users = []server.User{
+	opts.BootstrapConfig.Users = []server.User{
 		{
 			Name:      "admin@example.com",
-			AccessKey: adminAccessKey,
+			AccessKey: server.Secret(adminAccessKey),
 		},
 	}
 	srv, err := server.New(opts)
@@ -214,13 +214,13 @@ func setupServerOptions(t *testing.T, opts *server.Options) {
 
 	key, err := os.ReadFile("testdata/pki/localhost.key")
 	assert.NilError(t, err)
-	opts.TLS.PrivateKey = string(key)
+	opts.TLS.PrivateKey = types.StringOrFile(key)
 
 	cert, err := os.ReadFile("testdata/pki/localhost.crt")
 	assert.NilError(t, err)
 	opts.TLS.Certificate = types.StringOrFile(cert)
 
-	pgDriver := database.PostgresDriver(t, "_cmd")
+	pgDriver := database.PostgresDriver(t, "cmd")
 	opts.DBConnectionString = pgDriver.DSN
 }
 
@@ -350,7 +350,7 @@ func TestLoginCmd_TLSVerify(t *testing.T) {
 	setupServerOptions(t, &opts)
 	accessKey := "0000000001.adminadminadminadmin1234"
 	opts.Users = []server.User{
-		{Name: "admin@example.com", AccessKey: accessKey},
+		{Name: "admin@example.com", AccessKey: server.Secret(accessKey)},
 	}
 	srv, err := server.New(opts)
 	assert.NilError(t, err)
